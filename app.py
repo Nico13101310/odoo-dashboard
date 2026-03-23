@@ -145,6 +145,15 @@ def label_for_status(value):
     return STATUS_LABELS.get(value, value or "—")
 
 
+def summarize_top_items(mapping, limit=5):
+    items = sorted(mapping.items(), key=lambda x: x[1], reverse=True)
+    top = items[:limit]
+    others_total = round(sum(v for _, v in items[limit:]), 2)
+    if others_total > 0:
+        top.append(("Autres", others_total))
+    return top
+
+
 def search_read_all(model, domain, fields, order=None, limit=ODOO_PAGE_SIZE):
     records = []
     offset = 0
@@ -195,8 +204,8 @@ def get_ca(period):
     previous = fetch_ca(prev_start, prev_end)
     total_current = round(sum(current.values()), 2)
     total_previous = round(sum(previous.values()), 2)
-    trie = sorted(current.items(), key=lambda x: x[1], reverse=True)[:10]
-    prev_trie = sorted(previous.items(), key=lambda x: x[1], reverse=True)[:10]
+    trie = summarize_top_items(current, limit=5)
+    prev_trie = summarize_top_items(previous, limit=5)
     return {
         "labels": [x[0] for x in trie],
         "values": [round(x[1], 2) for x in trie],
@@ -350,6 +359,8 @@ def get_sales_pipeline(period):
         "order_total_prev": previous["order_total"],
         "quote_count_prev": previous["quote_count"],
         "order_count_prev": previous["order_count"],
+        "quote_pct": pct_change(current["quote_total"], previous["quote_total"]),
+        "order_pct": pct_change(current["order_total"], previous["order_total"]),
         "quotes": current["quotes"],
         "orders": current["orders"],
         "period_label": f"{start} → {end}",
@@ -390,7 +401,7 @@ HTML = """
   .refresh-btn { background: var(--surface2); color: var(--text); border: 1px solid var(--border); padding: 7px 14px; border-radius: 6px; font-size: 12px; font-weight: 500; cursor: pointer; font-family: 'DM Sans', sans-serif; transition: all 0.15s; }
   .refresh-btn:hover { border-color: var(--accent); color: var(--accent); }
   main { padding: 28px 40px; max-width: 1400px; margin: 0 auto; }
-  .kpi-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; margin-bottom: 28px; }
+  .kpi-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 16px; margin-bottom: 28px; }
   .kpi-card { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 22px; position: relative; overflow: hidden; }
   .kpi-card::before { content: ''; position: absolute; top: 0; left: 0; right: 0; height: 2px; }
   .kpi-card.blue::before { background: var(--accent); }
@@ -509,17 +520,32 @@ HTML = """
     </div>
     <div class="kpi-card green">
       <div class="kpi-top">
-        <div class="kpi-label">Pipeline commercial</div>
+        <div class="kpi-label">Devis en cours</div>
         <div class="kpi-local-filter">
           <button class="kpi-filter-btn active" onclick="setLocalKpi('sales','month',this)">M</button>
           <button class="kpi-filter-btn" onclick="setLocalKpi('sales','quarter',this)">T</button>
           <button class="kpi-filter-btn" onclick="setLocalKpi('sales','year',this)">A</button>
         </div>
       </div>
-      <div class="kpi-value green" id="kpiSales">—</div>
+      <div class="kpi-value green" id="kpiQuotes">—</div>
       <div class="kpi-bottom">
-        <div class="kpi-sub" id="kpiSalesSub">Chargement...</div>
-        <div id="kpiSalesPct"></div>
+        <div class="kpi-sub" id="kpiQuotesSub">Chargement...</div>
+        <div id="kpiQuotesPct"></div>
+      </div>
+    </div>
+    <div class="kpi-card green">
+      <div class="kpi-top">
+        <div class="kpi-label">Bons à facturer</div>
+        <div class="kpi-local-filter">
+          <button class="kpi-filter-btn active" onclick="setLocalKpi('sales','month',this)">M</button>
+          <button class="kpi-filter-btn" onclick="setLocalKpi('sales','quarter',this)">T</button>
+          <button class="kpi-filter-btn" onclick="setLocalKpi('sales','year',this)">A</button>
+        </div>
+      </div>
+      <div class="kpi-value green" id="kpiOrders">—</div>
+      <div class="kpi-bottom">
+        <div class="kpi-sub" id="kpiOrdersSub">Chargement...</div>
+        <div id="kpiOrdersPct"></div>
       </div>
     </div>
   </div>
@@ -529,7 +555,7 @@ HTML = """
       <div class="card-header">
         <div>
           <div class="card-title">Chiffre d'affaires</div>
-          <div class="card-sub" id="caChartSub">Top 10 clients</div>
+          <div class="card-sub" id="caChartSub">Top 5 clients + autres</div>
         </div>
         <div>
           <div class="local-filters">
@@ -682,9 +708,9 @@ async function loadCA() {
       fetchJson(`/api/ca?period=${localKpi.ca}`),
     ]);
     document.getElementById('kpiCA').textContent = fmt(kpiData.total);
-    document.getElementById('kpiCASub').textContent = `${chartData.labels.length} client(s) — ${kpiData.period_label}`;
+    document.getElementById('kpiCASub').textContent = `${kpiData.labels.length} poste(s) — ${kpiData.period_label}`;
     document.getElementById('kpiCAPct').innerHTML = pctBadge(kpiData.pct);
-    document.getElementById('caChartSub').textContent = `Top 10 clients — ${chartData.period_label}`;
+    document.getElementById('caChartSub').textContent = `Top 5 clients + autres — ${chartData.period_label}`;
     if (chartCA) chartCA.destroy();
     const datasets = [{ label: 'Période actuelle', data: chartData.values, backgroundColor: 'rgba(79,142,247,0.7)', borderColor: 'rgba(79,142,247,1)', borderWidth: 1, borderRadius: 4 }];
     if (compare) datasets.push({ label: 'Année précédente', data: chartData.prev_values, backgroundColor: 'rgba(79,142,247,0.2)', borderColor: 'rgba(79,142,247,0.5)', borderWidth: 1, borderRadius: 4 });
@@ -706,9 +732,12 @@ async function loadSales() {
       fetchJson(`/api/sales?period=${localKpi.sales}`),
       fetchJson(`/api/sales?period=${periods.salesTable}`),
     ]);
-    document.getElementById('kpiSales').textContent = fmt(kpiData.total);
-    document.getElementById('kpiSalesSub').textContent = `${kpiData.quote_count} devis + ${kpiData.order_count} commande(s) — ${kpiData.period_label}`;
-    document.getElementById('kpiSalesPct').innerHTML = pctBadge(kpiData.pct);
+    document.getElementById('kpiQuotes').textContent = fmt(kpiData.quote_total);
+    document.getElementById('kpiQuotesSub').textContent = `${kpiData.quote_count} devis — ${kpiData.period_label}`;
+    document.getElementById('kpiQuotesPct').innerHTML = pctBadge(kpiData.quote_pct);
+    document.getElementById('kpiOrders').textContent = fmt(kpiData.order_total);
+    document.getElementById('kpiOrdersSub').textContent = `${kpiData.order_count} commande(s) — ${kpiData.period_label}`;
+    document.getElementById('kpiOrdersPct').innerHTML = pctBadge(kpiData.order_pct);
     document.getElementById('salesChartSub').textContent = `Montants HTVA — ${chartData.period_label}`;
     document.getElementById('salesTableSub').textContent = `Devis en cours et bons à facturer — ${tableData.period_label}`;
 
@@ -722,7 +751,7 @@ async function loadSales() {
     });
 
     const renderSection = (title, rows, statusClass) => {
-      if (!rows.length) return `<div><div class="mini-table-title">${title}</div><div class="empty-state">Aucun élément sur la période</div></div>`;
+      if (!rows.length) return `<div><div class="mini-table-title">${title}</div><div class="empty-state">${title === 'Devis en cours' ? 'Aucun devis en cours sur la période' : 'Aucun bon à facturer sur la période'}</div></div>`;
       let html = `<div><div class="mini-table-title">${title}</div><table><thead><tr><th>Numéro</th><th>Client</th><th>Montant</th><th>Date</th><th>Statut</th></tr></thead><tbody>`;
       for (const r of rows) {
         html += `<tr><td><span style="font-family:monospace;font-size:12px;color:#8890a8">${r.numero}</span></td><td>${r.client}</td><td><span class="montant">${fmt(r.montant)}</span></td><td><span style="font-family:monospace;font-size:12px">${r.date || '—'}</span></td><td><span class="status-badge ${statusClass}">${r.invoice_status_label}</span></td></tr>`;
@@ -735,7 +764,8 @@ async function loadSales() {
   } catch (error) {
     showError('chartSales', error);
     showError('tableSales', error);
-    document.getElementById('kpiSalesSub').textContent = 'Erreur';
+    document.getElementById('kpiQuotesSub').textContent = 'Erreur';
+    document.getElementById('kpiOrdersSub').textContent = 'Erreur';
   }
 }
 
@@ -753,10 +783,11 @@ async function loadRetard() {
       document.getElementById('tableRetard').innerHTML = '<div class="empty-state">✅ Aucune facture en retard</div>';
       return;
     }
-    let html = `<table><thead><tr><th>Numéro</th><th>Client</th><th>Montant dû</th><th>Échéance</th><th>Retard</th></tr></thead><tbody>`;
+    let html = `<table><thead><tr><th>Numéro</th><th>Client</th><th>Montant dû</th><th>Échéance</th><th>Retard</th><th>Priorité</th></tr></thead><tbody>`;
     for (const f of tableData.factures) {
       const cls = f.retard_jours > 60 ? 'retard-high' : f.retard_jours > 30 ? 'retard-mid' : 'retard-low';
-      html += `<tr><td><span style="font-family:monospace;font-size:12px;color:#8890a8">${f.numero}</span></td><td>${f.client}</td><td><span class="montant">${fmt(f.montant)}</span></td><td><span style="font-family:monospace;font-size:12px">${f.echeance}</span></td><td><span class="retard-badge ${cls}">+${f.retard_jours}j</span></td></tr>`;
+      const priority = f.retard_jours > 60 ? 'Critique' : f.retard_jours > 30 ? 'Haute' : 'Normale';
+      html += `<tr><td><span style="font-family:monospace;font-size:12px;color:#8890a8">${f.numero}</span></td><td>${f.client}</td><td><span class="montant">${fmt(f.montant)}</span></td><td><span style="font-family:monospace;font-size:12px">${f.echeance}</span></td><td><span class="retard-badge ${cls}">+${f.retard_jours}j</span></td><td><span class="status-badge ${cls === 'retard-high' ? '' : cls === 'retard-mid' ? '' : ''}">${priority}</span></td></tr>`;
     }
     html += '</tbody></table>';
     document.getElementById('tableRetard').innerHTML = html;
