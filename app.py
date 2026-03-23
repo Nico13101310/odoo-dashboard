@@ -154,6 +154,10 @@ def summarize_top_items(mapping, limit=5):
     return top
 
 
+def get_odoo_record_url(model, record_id):
+    return f"{ODOO_URL}/web#id={record_id}&model={model}&view_type=form"
+
+
 def search_read_all(model, domain, fields, order=None, limit=ODOO_PAGE_SIZE):
     records = []
     offset = 0
@@ -237,7 +241,7 @@ def get_factures_retard(period):
                 ["invoice_date", ">=", str(d_start)],
                 ["invoice_date", "<=", str(d_end)],
             ],
-            ["name", "partner_id", "amount_residual", "invoice_date_due"],
+            ["id", "name", "partner_id", "amount_residual", "invoice_date_due"],
             order="invoice_date_due asc",
         )
 
@@ -249,12 +253,25 @@ def get_factures_retard(period):
                 continue
             due = datetime.strptime(due_raw, "%Y-%m-%d").date()
             retard = (today - due).days
+            if retard > 60:
+                priority_label = "Critique"
+                priority_class = "retard-high"
+            elif retard > 30:
+                priority_label = "Haute"
+                priority_class = "retard-mid"
+            else:
+                priority_label = "Normale"
+                priority_class = "retard-low"
             result.append({
+                "id": inv.get("id"),
                 "numero": inv.get("name") or "—",
                 "client": inv["partner_id"][1] if inv.get("partner_id") else "Inconnu",
                 "montant": round(inv.get("amount_residual") or 0, 2),
                 "echeance": due_raw,
                 "retard_jours": retard,
+                "priority_label": priority_label,
+                "priority_class": priority_class,
+                "url": get_odoo_record_url("account.move", inv.get("id")),
             })
         result.sort(key=lambda x: x["retard_jours"], reverse=True)
         return result
@@ -277,7 +294,7 @@ def get_factures_retard(period):
 
 @cached()
 def fetch_sales_pipeline(date_debut, date_fin):
-    fields = ["name", "partner_id", "amount_untaxed", "date_order", "state", "invoice_status"]
+    fields = ["id", "name", "partner_id", "amount_untaxed", "date_order", "state", "invoice_status"]
 
     quotes = search_read_all(
         "sale.order",
@@ -307,6 +324,7 @@ def fetch_sales_pipeline(date_debut, date_fin):
         rows = []
         for rec in records:
             rows.append({
+                "id": rec.get("id"),
                 "type": kind,
                 "numero": rec.get("name") or "—",
                 "client": rec["partner_id"][1] if rec.get("partner_id") else "Inconnu",
@@ -316,6 +334,7 @@ def fetch_sales_pipeline(date_debut, date_fin):
                 "state_label": label_for_status(rec.get("state")),
                 "invoice_status": rec.get("invoice_status") or "",
                 "invoice_status_label": label_for_status(rec.get("invoice_status")),
+                "url": get_odoo_record_url("sale.order", rec.get("id")),
             })
         return rows
 
@@ -449,6 +468,10 @@ HTML = """
   .retard-high { background: rgba(247,99,79,0.3); color: var(--danger); }
   .status-badge { display: inline-block; padding: 2px 8px; border-radius: 4px; font-family: 'DM Mono', monospace; font-size: 11px; font-weight: 500; background: rgba(79,142,247,0.15); color: var(--accent); }
   .success-badge { background: rgba(79,247,160,0.15); color: var(--success); }
+  .warning-badge { background: rgba(247,196,79,0.15); color: var(--warning); }
+  .danger-badge { background: rgba(247,99,79,0.18); color: var(--danger); }
+  .action-link { display: inline-block; padding: 5px 9px; border: 1px solid var(--border); border-radius: 6px; color: var(--text); text-decoration: none; font-size: 11px; transition: all 0.15s; }
+  .action-link:hover { border-color: var(--accent); color: var(--accent); }
   .montant { font-family: 'DM Mono', monospace; font-size: 13px; font-weight: 500; }
   .loading, .empty-state, .error-state { display: flex; align-items: center; justify-content: center; min-height: 160px; color: var(--text2); font-size: 13px; gap: 10px; text-align: center; padding: 20px; }
   .error-state { color: #ffb4a7; }
@@ -752,9 +775,9 @@ async function loadSales() {
 
     const renderSection = (title, rows, statusClass) => {
       if (!rows.length) return `<div><div class="mini-table-title">${title}</div><div class="empty-state">${title === 'Devis en cours' ? 'Aucun devis en cours sur la période' : 'Aucun bon à facturer sur la période'}</div></div>`;
-      let html = `<div><div class="mini-table-title">${title}</div><table><thead><tr><th>Numéro</th><th>Client</th><th>Montant</th><th>Date</th><th>Statut</th></tr></thead><tbody>`;
+      let html = `<div><div class="mini-table-title">${title}</div><table><thead><tr><th>Numéro</th><th>Client</th><th>Montant</th><th>Date</th><th>Statut</th><th></th></tr></thead><tbody>`;
       for (const r of rows) {
-        html += `<tr><td><span style="font-family:monospace;font-size:12px;color:#8890a8">${r.numero}</span></td><td>${r.client}</td><td><span class="montant">${fmt(r.montant)}</span></td><td><span style="font-family:monospace;font-size:12px">${r.date || '—'}</span></td><td><span class="status-badge ${statusClass}">${r.invoice_status_label}</span></td></tr>`;
+        html += `<tr><td><span style="font-family:monospace;font-size:12px;color:#8890a8">${r.numero}</span></td><td>${r.client}</td><td><span class="montant">${fmt(r.montant)}</span></td><td><span style="font-family:monospace;font-size:12px">${r.date || '—'}</span></td><td><span class="status-badge ${statusClass}">${r.invoice_status_label}</span></td><td><a class="action-link" href="${r.url}" target="_blank" rel="noopener noreferrer">Voir</a></td></tr>`;
       }
       html += '</tbody></table></div>';
       return html;
@@ -783,11 +806,10 @@ async function loadRetard() {
       document.getElementById('tableRetard').innerHTML = '<div class="empty-state">✅ Aucune facture en retard</div>';
       return;
     }
-    let html = `<table><thead><tr><th>Numéro</th><th>Client</th><th>Montant dû</th><th>Échéance</th><th>Retard</th><th>Priorité</th></tr></thead><tbody>`;
+    let html = `<table><thead><tr><th>Numéro</th><th>Client</th><th>Montant dû</th><th>Échéance</th><th>Retard</th><th>Priorité</th><th></th></tr></thead><tbody>`;
     for (const f of tableData.factures) {
-      const cls = f.retard_jours > 60 ? 'retard-high' : f.retard_jours > 30 ? 'retard-mid' : 'retard-low';
-      const priority = f.retard_jours > 60 ? 'Critique' : f.retard_jours > 30 ? 'Haute' : 'Normale';
-      html += `<tr><td><span style="font-family:monospace;font-size:12px;color:#8890a8">${f.numero}</span></td><td>${f.client}</td><td><span class="montant">${fmt(f.montant)}</span></td><td><span style="font-family:monospace;font-size:12px">${f.echeance}</span></td><td><span class="retard-badge ${cls}">+${f.retard_jours}j</span></td><td><span class="status-badge ${cls === 'retard-high' ? '' : cls === 'retard-mid' ? '' : ''}">${priority}</span></td></tr>`;
+      const badgeClass = f.priority_class === 'retard-high' ? 'danger-badge' : f.priority_class === 'retard-mid' ? 'warning-badge' : 'status-badge';
+      html += `<tr><td><span style="font-family:monospace;font-size:12px;color:#8890a8">${f.numero}</span></td><td>${f.client}</td><td><span class="montant">${fmt(f.montant)}</span></td><td><span style="font-family:monospace;font-size:12px">${f.echeance}</span></td><td><span class="retard-badge ${f.priority_class}">+${f.retard_jours}j</span></td><td><span class="status-badge ${badgeClass}">${f.priority_label}</span></td><td><a class="action-link" href="${f.url}" target="_blank" rel="noopener noreferrer">Voir</a></td></tr>`;
     }
     html += '</tbody></table>';
     document.getElementById('tableRetard').innerHTML = html;
