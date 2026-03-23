@@ -1,75 +1,193 @@
 from flask import Flask, render_template_string, jsonify, request
-import xmlrpc.client
-import ssl
-import json
 import os
-from datetime import datetime, date, timedelta
+import ssl
+import time
+import xmlrpc.client
+from datetime import date, datetime, timedelta
 from dateutil.relativedelta import relativedelta
 
 app = Flask(__name__)
 
-ssl_context = ssl.create_default_context()
-ssl_context.check_hostname = False
-ssl_context.verify_mode = ssl.CERT_NONE
-
-ODOO_URL = os.environ.get("ODOO_URL", "")
+ODOO_URL = os.environ.get("ODOO_URL", "").rstrip("/")
 ODOO_DB = os.environ.get("ODOO_DB", "")
 ODOO_USERNAME = os.environ.get("ODOO_USERNAME", "")
 ODOO_API_KEY = os.environ.get("ODOO_API_KEY", "")
+CACHE_TTL = int(os.environ.get("CACHE_TTL", "120"))
+ODOO_PAGE_SIZE = int(os.environ.get("ODOO_PAGE_SIZE", "200"))
+ALLOW_INSECURE_SSL = os.environ.get("ODOO_INSECURE_SSL", "0") == "1"
+
+_cache = {}
+
+
+def _validate_env():
+    missing = [
+        key for key, value in {
+            "ODOO_URL": ODOO_URL,
+            "ODOO_DB": ODOO_DB,
+            "ODOO_USERNAME": ODOO_USERNAME,
+            "ODOO_API_KEY": ODOO_API_KEY,
+        }.items() if not value
+    ]
+    if missing:
+        raise RuntimeError(f"Variables d'environnement manquantes : {', '.join(missing)}")
+
+
+_validate_env()
+
+
+def cached(ttl_seconds=CACHE_TTL):
+    def decorator(func):
+        def wrapper(*args):
+            key = (func.__name__, args)
+            now = time.time()
+            item = _cache.get(key)
+            if item and now - item["ts"] < ttl_seconds:
+                return item["value"]
+            value = func(*args)
+            _cache[key] = {"ts": now, "value": value}
+            return value
+        wrapper.__name__ = func.__name__
+        return wrapper
+    return decorator
+
+
+class OdooDashboardError(Exception):
+    pass
+
 
 def get_connection():
-    common = xmlrpc.client.ServerProxy(f"{ODOO_URL}/xmlrpc/2/common", context=ssl_context)
-    uid = common.authenticate(ODOO_DB, ODOO_USERNAME, ODOO_API_KEY, {})
-    models = xmlrpc.client.ServerProxy(f"{ODOO_URL}/xmlrpc/2/object", context=ssl_context)
-    return models, uid
+    try:
+        ssl_context = None
+        if ALLOW_INSECURE_SSL:
+            ssl_context = ssl.create_default_context()
+            ssl_context.check_hostname = False
+            ssl_context.verify_mode = ssl.CERT_NONE
+
+        common = xmlrpc.client.ServerProxy(
+            f"{ODOO_URL}/xmlrpc/2/common",
+            context=ssl_context,
+            allow_none=True,
+        )
+        uid = common.authenticate(ODOO_DB, ODOO_USERNAME, ODOO_API_KEY, {})
+        if not uid:
+            raise OdooDashboardError(
+                "Authentification Odoo refusée. Vérifie ODOO_DB, ODOO_USERNAME et ODOO_API_KEY."
+            )
+        models = xmlrpc.client.ServerProxy(
+            f"{ODOO_URL}/xmlrpc/2/object",
+            context=ssl_context,
+            allow_none=True,
+        )
+        return models, uid
+    except OdooDashboardError:
+        raise
+    except Exception as exc:
+        raise OdooDashboardError(f"Connexion Odoo impossible : {exc}") from exc
+
+
+def execute_kw(model, method, args=None, kwargs=None):
+    args = args or []
+    kwargs = kwargs or {}
+    models, uid = get_connection()
+    try:
+        return models.execute_kw(ODOO_DB, uid, ODOO_API_KEY, model, method, args, kwargs)
+    except xmlrpc.client.Fault as exc:
+        raise OdooDashboardError(f"Erreur Odoo ({model}.{method}) : {exc}") from exc
+    except Exception as exc:
+        raise OdooDashboardError(f"Erreur réseau Odoo ({model}.{method}) : {exc}") from exc
+
+
+VALID_PERIODS = {"today", "week", "month", "quarter", "year"}
+
 
 def get_period_dates(period):
+    period = period if period in VALID_PERIODS else "month"
     today = date.today()
     if period == "today":
         return today, today
-    elif period == "week":
+    if period == "week":
         start = today - timedelta(days=today.weekday())
         return start, today
-    elif period == "month":
+    if period == "month":
         return today.replace(day=1), today
-    elif period == "quarter":
+    if period == "quarter":
         q = (today.month - 1) // 3
         start = date(today.year, q * 3 + 1, 1)
         return start, today
-    elif period == "year":
-        return today.replace(month=1, day=1), today
-    else:
-        return today.replace(day=1), today
+    return today.replace(month=1, day=1), today
+
 
 def get_prev_period_dates(period):
     start, end = get_period_dates(period)
     return start - relativedelta(years=1), end - relativedelta(years=1)
+
 
 def pct_change(current, previous):
     if previous == 0:
         return None
     return round((current - previous) / previous * 100, 1)
 
-# ── CA ─────────────────────────────────────────────────────
+
+STATUS_LABELS = {
+    "draft": "Devis",
+    "sent": "Devis envoyé",
+    "sale": "Commande",
+    "done": "Terminé",
+    "cancel": "Annulé",
+    "upselling": "Upsell",
+    "no": "Rien à facturer",
+    "to invoice": "À facturer",
+    "invoiced": "Entièrement facturé",
+}
+
+
+def label_for_status(value):
+    return STATUS_LABELS.get(value, value or "—")
+
+
+def search_read_all(model, domain, fields, order=None, limit=ODOO_PAGE_SIZE):
+    records = []
+    offset = 0
+    while True:
+        batch = execute_kw(
+            model,
+            "search_read",
+            [domain],
+            {
+                "fields": fields,
+                "limit": limit,
+                "offset": offset,
+                **({"order": order} if order else {}),
+            },
+        )
+        records.extend(batch)
+        if len(batch) < limit:
+            break
+        offset += limit
+    return records
+
+
+@cached()
 def fetch_ca(date_debut, date_fin):
-    models, uid = get_connection()
-    invoices = models.execute_kw(
-        ODOO_DB, uid, ODOO_API_KEY,
-        "account.move", "search_read",
-        [[
+    invoices = search_read_all(
+        "account.move",
+        [
             ["move_type", "=", "out_invoice"],
             ["state", "=", "posted"],
             ["invoice_date", ">=", str(date_debut)],
             ["invoice_date", "<=", str(date_fin)],
-        ]],
-        {"fields": ["partner_id", "amount_untaxed"], "limit": 500}
+        ],
+        ["partner_id", "amount_untaxed"],
+        order="amount_untaxed desc",
     )
     ca = {}
     for inv in invoices:
-        nom = inv["partner_id"][1] if inv["partner_id"] else "Inconnu"
-        ca[nom] = ca.get(nom, 0) + inv["amount_untaxed"]
+        nom = inv["partner_id"][1] if inv.get("partner_id") else "Inconnu"
+        ca[nom] = ca.get(nom, 0) + (inv.get("amount_untaxed") or 0)
     return ca
 
+
+@cached()
 def get_ca(period):
     start, end = get_period_dates(period)
     prev_start, prev_end = get_prev_period_dates(period)
@@ -91,39 +209,43 @@ def get_ca(period):
         "prev_period_label": f"{prev_start} → {prev_end}",
     }
 
-# ── Factures en retard ─────────────────────────────────────
+
+@cached()
 def get_factures_retard(period):
-    models, uid = get_connection()
     start, end = get_period_dates(period)
     prev_start, prev_end = get_prev_period_dates(period)
     today = date.today()
 
     def fetch(d_start, d_end):
-        return models.execute_kw(
-            ODOO_DB, uid, ODOO_API_KEY,
-            "account.move", "search_read",
-            [[
+        return search_read_all(
+            "account.move",
+            [
                 ["move_type", "=", "out_invoice"],
                 ["state", "=", "posted"],
                 ["payment_state", "in", ["not_paid", "partial"]],
+                ["invoice_date_due", "!=", False],
                 ["invoice_date_due", "<", str(today)],
                 ["invoice_date", ">=", str(d_start)],
                 ["invoice_date", "<=", str(d_end)],
-            ]],
-            {"fields": ["name", "partner_id", "amount_residual", "invoice_date_due"], "limit": 200}
+            ],
+            ["name", "partner_id", "amount_residual", "invoice_date_due"],
+            order="invoice_date_due asc",
         )
 
     def process(invoices):
         result = []
         for inv in invoices:
-            due = datetime.strptime(inv["invoice_date_due"], "%Y-%m-%d").date()
+            due_raw = inv.get("invoice_date_due")
+            if not due_raw:
+                continue
+            due = datetime.strptime(due_raw, "%Y-%m-%d").date()
             retard = (today - due).days
             result.append({
-                "numero": inv["name"],
-                "client": inv["partner_id"][1] if inv["partner_id"] else "Inconnu",
-                "montant": round(inv["amount_residual"], 2),
-                "echeance": inv["invoice_date_due"],
-                "retard_jours": retard
+                "numero": inv.get("name") or "—",
+                "client": inv["partner_id"][1] if inv.get("partner_id") else "Inconnu",
+                "montant": round(inv.get("amount_residual") or 0, 2),
+                "echeance": due_raw,
+                "retard_jours": retard,
             })
         result.sort(key=lambda x: x["retard_jours"], reverse=True)
         return result
@@ -143,49 +265,98 @@ def get_factures_retard(period):
         "prev_period_label": f"{prev_start} → {prev_end}",
     }
 
-# ── Dépenses ───────────────────────────────────────────────
-def fetch_depenses(date_debut, date_fin):
-    models, uid = get_connection()
-    lines = models.execute_kw(
-        ODOO_DB, uid, ODOO_API_KEY,
-        "account.move.line", "search_read",
-        [[
-            ["move_id.move_type", "in", ["in_invoice", "in_refund"]],
-            ["move_id.state", "=", "posted"],
-            ["date", ">=", str(date_debut)],
-            ["date", "<=", str(date_fin)],
-            ["account_id.account_type", "in", ["expense", "expense_depreciation", "expense_direct_cost"]],
-        ]],
-        {"fields": ["account_id", "debit"], "limit": 500}
-    )
-    dep = {}
-    for line in lines:
-        compte = line["account_id"][1] if line["account_id"] else "Inconnu"
-        dep[compte] = dep.get(compte, 0) + line["debit"]
-    return dep
 
-def get_depenses(period):
+@cached()
+def fetch_sales_pipeline(date_debut, date_fin):
+    fields = ["name", "partner_id", "amount_untaxed", "date_order", "state", "invoice_status"]
+
+    quotes = search_read_all(
+        "sale.order",
+        [
+            ["state", "in", ["draft", "sent"]],
+            ["invoice_status", "=", "no"],
+            ["date_order", ">=", f"{date_debut} 00:00:00"],
+            ["date_order", "<=", f"{date_fin} 23:59:59"],
+        ],
+        fields,
+        order="date_order desc",
+    )
+
+    orders_to_invoice = search_read_all(
+        "sale.order",
+        [
+            ["state", "in", ["sale", "done"]],
+            ["invoice_status", "=", "to invoice"],
+            ["date_order", ">=", f"{date_debut} 00:00:00"],
+            ["date_order", "<=", f"{date_fin} 23:59:59"],
+        ],
+        fields,
+        order="date_order desc",
+    )
+
+    def map_rows(records, kind):
+        rows = []
+        for rec in records:
+            rows.append({
+                "type": kind,
+                "numero": rec.get("name") or "—",
+                "client": rec["partner_id"][1] if rec.get("partner_id") else "Inconnu",
+                "montant": round(rec.get("amount_untaxed") or 0, 2),
+                "date": (rec.get("date_order") or "")[:10],
+                "state": rec.get("state") or "",
+                "state_label": label_for_status(rec.get("state")),
+                "invoice_status": rec.get("invoice_status") or "",
+                "invoice_status_label": label_for_status(rec.get("invoice_status")),
+            })
+        return rows
+
+    quotes_rows = map_rows(quotes, "devis")
+    orders_rows = map_rows(orders_to_invoice, "commande")
+
+    return {
+        "quotes": quotes_rows,
+        "orders": orders_rows,
+        "quote_total": round(sum(x["montant"] for x in quotes_rows), 2),
+        "order_total": round(sum(x["montant"] for x in orders_rows), 2),
+        "quote_count": len(quotes_rows),
+        "order_count": len(orders_rows),
+    }
+
+
+@cached()
+def get_sales_pipeline(period):
     start, end = get_period_dates(period)
     prev_start, prev_end = get_prev_period_dates(period)
-    current = fetch_depenses(start, end)
-    previous = fetch_depenses(prev_start, prev_end)
-    total_current = round(sum(current.values()), 2)
-    total_previous = round(sum(previous.values()), 2)
-    trie = sorted(current.items(), key=lambda x: x[1], reverse=True)[:10]
-    prev_trie = sorted(previous.items(), key=lambda x: x[1], reverse=True)[:10]
+
+    current = fetch_sales_pipeline(start, end)
+    previous = fetch_sales_pipeline(prev_start, prev_end)
+
+    total_current = round(current["quote_total"] + current["order_total"], 2)
+    total_previous = round(previous["quote_total"] + previous["order_total"], 2)
+
     return {
-        "labels": [x[0] for x in trie],
-        "values": [round(x[1], 2) for x in trie],
-        "prev_labels": [x[0] for x in prev_trie],
-        "prev_values": [round(x[1], 2) for x in prev_trie],
+        "labels": ["Devis en cours", "Bons à facturer"],
+        "values": [current["quote_total"], current["order_total"]],
+        "prev_labels": ["Devis en cours", "Bons à facturer"],
+        "prev_values": [previous["quote_total"], previous["order_total"]],
         "total": total_current,
         "total_prev": total_previous,
         "pct": pct_change(total_current, total_previous),
+        "quote_total": current["quote_total"],
+        "order_total": current["order_total"],
+        "quote_count": current["quote_count"],
+        "order_count": current["order_count"],
+        "quote_total_prev": previous["quote_total"],
+        "order_total_prev": previous["order_total"],
+        "quote_count_prev": previous["quote_count"],
+        "order_count_prev": previous["order_count"],
+        "quotes": current["quotes"],
+        "orders": current["orders"],
         "period_label": f"{start} → {end}",
         "prev_period_label": f"{prev_start} → {prev_end}",
     }
 
-# ── HTML ───────────────────────────────────────────────────
+
 HTML = """
 <!DOCTYPE html>
 <html lang="fr">
@@ -204,26 +375,21 @@ HTML = """
   }
   * { margin: 0; padding: 0; box-sizing: border-box; }
   body { background: var(--bg); color: var(--text); font-family: 'DM Sans', sans-serif; min-height: 100vh; }
-
   header { padding: 20px 40px; border-bottom: 1px solid var(--border); background: var(--surface); display: flex; align-items: center; justify-content: space-between; gap: 16px; flex-wrap: wrap; }
   .logo { display: flex; align-items: center; gap: 12px; }
   .logo-icon { width: 36px; height: 36px; background: var(--accent); border-radius: 8px; display: flex; align-items: center; justify-content: center; font-size: 18px; }
   .logo-text { font-size: 18px; font-weight: 600; }
   .logo-sub { font-size: 12px; color: var(--text2); font-family: 'DM Mono', monospace; }
-
   .global-filters { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
   .filter-label { font-size: 12px; color: var(--text2); margin-right: 4px; }
   .filter-btn { background: var(--bg); border: 1px solid var(--border); color: var(--text2); padding: 6px 12px; border-radius: 6px; font-size: 12px; cursor: pointer; font-family: 'DM Sans', sans-serif; transition: all 0.15s; }
   .filter-btn:hover { border-color: var(--accent); color: var(--text); }
   .filter-btn.active { background: var(--accent); border-color: var(--accent); color: white; }
-
   .header-right { display: flex; align-items: center; gap: 10px; }
   .date-badge { font-family: 'DM Mono', monospace; font-size: 11px; color: var(--text2); background: var(--bg); padding: 6px 10px; border-radius: 6px; border: 1px solid var(--border); }
   .refresh-btn { background: var(--surface2); color: var(--text); border: 1px solid var(--border); padding: 7px 14px; border-radius: 6px; font-size: 12px; font-weight: 500; cursor: pointer; font-family: 'DM Sans', sans-serif; transition: all 0.15s; }
   .refresh-btn:hover { border-color: var(--accent); color: var(--accent); }
-
   main { padding: 28px 40px; max-width: 1400px; margin: 0 auto; }
-
   .kpi-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; margin-bottom: 28px; }
   .kpi-card { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 22px; position: relative; overflow: hidden; }
   .kpi-card::before { content: ''; position: absolute; top: 0; left: 0; right: 0; height: 2px; }
@@ -246,7 +412,6 @@ HTML = """
   .pct-up { background: rgba(79,247,160,0.15); color: var(--success); }
   .pct-down { background: rgba(247,99,79,0.15); color: var(--danger); }
   .pct-neutral { background: rgba(136,144,168,0.15); color: var(--text2); }
-
   .charts-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; margin-bottom: 20px; }
   .chart-card { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 22px; }
   .card-header { display: flex; align-items: flex-start; justify-content: space-between; margin-bottom: 16px; gap: 12px; }
@@ -260,7 +425,6 @@ HTML = """
   .compare-toggle label { font-size: 11px; color: var(--text2); cursor: pointer; }
   .compare-toggle input { cursor: pointer; accent-color: var(--accent); }
   canvas { max-height: 240px; }
-
   .table-card { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 22px; margin-bottom: 20px; }
   table { width: 100%; border-collapse: collapse; margin-top: 4px; }
   thead th { text-align: left; font-size: 11px; color: var(--text2); text-transform: uppercase; letter-spacing: 1px; padding: 8px 12px; border-bottom: 1px solid var(--border); font-weight: 500; }
@@ -272,15 +436,17 @@ HTML = """
   .retard-low { background: rgba(247,196,79,0.15); color: var(--warning); }
   .retard-mid { background: rgba(247,99,79,0.15); color: var(--danger); }
   .retard-high { background: rgba(247,99,79,0.3); color: var(--danger); }
+  .status-badge { display: inline-block; padding: 2px 8px; border-radius: 4px; font-family: 'DM Mono', monospace; font-size: 11px; font-weight: 500; background: rgba(79,142,247,0.15); color: var(--accent); }
+  .success-badge { background: rgba(79,247,160,0.15); color: var(--success); }
   .montant { font-family: 'DM Mono', monospace; font-size: 13px; font-weight: 500; }
-
-  .loading { display: flex; align-items: center; justify-content: center; height: 160px; color: var(--text2); font-size: 13px; gap: 10px; }
+  .loading, .empty-state, .error-state { display: flex; align-items: center; justify-content: center; min-height: 160px; color: var(--text2); font-size: 13px; gap: 10px; text-align: center; padding: 20px; }
+  .error-state { color: #ffb4a7; }
   .spinner { width: 16px; height: 16px; border: 2px solid var(--border); border-top-color: var(--accent); border-radius: 50%; animation: spin 0.8s linear infinite; }
+  .split-list { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  .mini-table-title { font-size: 12px; font-weight: 600; margin-bottom: 8px; color: var(--text); }
   @keyframes spin { to { transform: rotate(360deg); } }
-
   @media (max-width: 900px) {
-    .kpi-grid { grid-template-columns: 1fr; }
-    .charts-grid { grid-template-columns: 1fr; }
+    .kpi-grid, .charts-grid, .split-list { grid-template-columns: 1fr; }
     main { padding: 16px; }
     header { padding: 16px; }
   }
@@ -305,7 +471,7 @@ HTML = """
   </div>
   <div class="header-right">
     <div class="date-badge" id="dateBadge">—</div>
-    <button class="refresh-btn" onclick="loadAll()">↻ Actualiser</button>
+    <button class="refresh-btn" onclick="refreshAll()">↻ Actualiser</button>
   </div>
 </header>
 
@@ -343,17 +509,17 @@ HTML = """
     </div>
     <div class="kpi-card green">
       <div class="kpi-top">
-        <div class="kpi-label">Dépenses</div>
+        <div class="kpi-label">Pipeline commercial</div>
         <div class="kpi-local-filter">
-          <button class="kpi-filter-btn active" onclick="setLocalKpi('depenses','month',this)">M</button>
-          <button class="kpi-filter-btn" onclick="setLocalKpi('depenses','quarter',this)">T</button>
-          <button class="kpi-filter-btn" onclick="setLocalKpi('depenses','year',this)">A</button>
+          <button class="kpi-filter-btn active" onclick="setLocalKpi('sales','month',this)">M</button>
+          <button class="kpi-filter-btn" onclick="setLocalKpi('sales','quarter',this)">T</button>
+          <button class="kpi-filter-btn" onclick="setLocalKpi('sales','year',this)">A</button>
         </div>
       </div>
-      <div class="kpi-value green" id="kpiDepenses">—</div>
+      <div class="kpi-value green" id="kpiSales">—</div>
       <div class="kpi-bottom">
-        <div class="kpi-sub" id="kpiDepensesSub">Chargement...</div>
-        <div id="kpiDepensesPct"></div>
+        <div class="kpi-sub" id="kpiSalesSub">Chargement...</div>
+        <div id="kpiSalesPct"></div>
       </div>
     </div>
   </div>
@@ -384,24 +550,24 @@ HTML = """
     <div class="chart-card">
       <div class="card-header">
         <div>
-          <div class="card-title">Dépenses par compte</div>
-          <div class="card-sub" id="depChartSub">Top 10 comptes</div>
+          <div class="card-title">Devis et bons à facturer</div>
+          <div class="card-sub" id="salesChartSub">Montants HTVA</div>
         </div>
         <div>
           <div class="local-filters">
-            <button class="local-filter-btn" onclick="setChartPeriod('dep','today',this)">Jour</button>
-            <button class="local-filter-btn" onclick="setChartPeriod('dep','week',this)">Semaine</button>
-            <button class="local-filter-btn active" onclick="setChartPeriod('dep','month',this)">Mois</button>
-            <button class="local-filter-btn" onclick="setChartPeriod('dep','quarter',this)">Trimestre</button>
-            <button class="local-filter-btn" onclick="setChartPeriod('dep','year',this)">Année</button>
+            <button class="local-filter-btn" onclick="setChartPeriod('sales','today',this)">Jour</button>
+            <button class="local-filter-btn" onclick="setChartPeriod('sales','week',this)">Semaine</button>
+            <button class="local-filter-btn active" onclick="setChartPeriod('sales','month',this)">Mois</button>
+            <button class="local-filter-btn" onclick="setChartPeriod('sales','quarter',this)">Trimestre</button>
+            <button class="local-filter-btn" onclick="setChartPeriod('sales','year',this)">Année</button>
           </div>
           <div class="compare-toggle">
-            <input type="checkbox" id="compareDep" onchange="loadDepenses()">
-            <label for="compareDep">vs année précédente</label>
+            <input type="checkbox" id="compareSales" onchange="loadSales()">
+            <label for="compareSales">vs année précédente</label>
           </div>
         </div>
       </div>
-      <canvas id="chartDep"></canvas>
+      <canvas id="chartSales"></canvas>
     </div>
   </div>
 
@@ -421,15 +587,32 @@ HTML = """
     </div>
     <div id="tableRetard"><div class="loading"><div class="spinner"></div> Chargement...</div></div>
   </div>
+
+  <div class="table-card">
+    <div class="card-header">
+      <div>
+        <div class="card-title">Détail commercial</div>
+        <div class="card-sub" id="salesTableSub">Devis en cours et bons à facturer</div>
+      </div>
+      <div class="local-filters">
+        <button class="local-filter-btn" onclick="setChartPeriod('salesTable','today',this)">Jour</button>
+        <button class="local-filter-btn" onclick="setChartPeriod('salesTable','week',this)">Semaine</button>
+        <button class="local-filter-btn active" onclick="setChartPeriod('salesTable','month',this)">Mois</button>
+        <button class="local-filter-btn" onclick="setChartPeriod('salesTable','quarter',this)">Trimestre</button>
+        <button class="local-filter-btn" onclick="setChartPeriod('salesTable','year',this)">Année</button>
+      </div>
+    </div>
+    <div id="tableSales"><div class="loading"><div class="spinner"></div> Chargement...</div></div>
+  </div>
 </main>
 
 <script>
-let chartCA = null, chartDep = null;
-let periods = { ca: 'month', dep: 'month', retardTable: 'month' };
-let localKpi = { ca: 'month', retard: 'month', depenses: 'month' };
+let chartCA = null, chartSales = null;
+let periods = { ca: 'month', sales: 'month', retardTable: 'month', salesTable: 'month' };
+let localKpi = { ca: 'month', retard: 'month', sales: 'month' };
 
 function fmt(n) {
-  return new Intl.NumberFormat('fr-BE', { style: 'currency', currency: 'EUR', maximumFractionDigits: 0 }).format(n);
+  return new Intl.NumberFormat('fr-BE', { style: 'currency', currency: 'EUR', maximumFractionDigits: 0 }).format(n || 0);
 }
 
 function pctBadge(pct) {
@@ -439,16 +622,38 @@ function pctBadge(pct) {
   return `<span class="pct-badge ${cls}">${sign}${pct}% vs N-1</span>`;
 }
 
-function setGlobal(period) {
-  document.querySelectorAll('.filter-btn').forEach(b => b.classList.toggle('active', b.dataset.period === period));
-  periods = { ca: period, dep: period, retardTable: period };
-  localKpi = { ca: period, retard: period, depenses: period };
-  document.querySelectorAll('.local-filter-btn, .kpi-filter-btn').forEach(b => {
-    const labels = { today: 'Jour', week: 'Semaine', month: 'Mois', quarter: 'Trimestre', year: 'Année', M: 'month', T: 'quarter', A: 'year' };
-    // reset all to inactive then re-activate matching
-    b.classList.remove('active');
+async function fetchJson(url) {
+  const response = await fetch(url);
+  const data = await response.json();
+  if (!response.ok || data.error) {
+    throw new Error(data.error || `Erreur HTTP ${response.status}`);
+  }
+  return data;
+}
+
+function showError(targetId, error) {
+  document.getElementById(targetId).innerHTML = `<div class="error-state">⚠️ ${error.message}</div>`;
+}
+
+function activateByPeriod(selector, period) {
+  document.querySelectorAll(selector).forEach(btn => {
+    btn.classList.toggle('active', btn.dataset.period === period);
   });
+}
+
+function setGlobal(period) {
+  activateByPeriod('.filter-btn', period);
+  periods = { ca: period, sales: period, retardTable: period, salesTable: period };
+  localKpi = { ca: period, retard: period, sales: period };
+  syncButtons();
   loadAll();
+}
+
+function syncButtons() {
+  document.querySelectorAll('[data-scope="ca-chart"]').forEach(b => b.classList.toggle('active', b.dataset.period === periods.ca));
+  document.querySelectorAll('[data-scope="sales-chart"]').forEach(b => b.classList.toggle('active', b.dataset.period === periods.sales));
+  document.querySelectorAll('[data-scope="retard-table"]').forEach(b => b.classList.toggle('active', b.dataset.period === periods.retardTable));
+  document.querySelectorAll('[data-scope="sales-table"]').forEach(b => b.classList.toggle('active', b.dataset.period === periods.salesTable));
 }
 
 function setLocalKpi(kpi, period, btn) {
@@ -457,7 +662,7 @@ function setLocalKpi(kpi, period, btn) {
   btn.classList.add('active');
   if (kpi === 'ca') loadCA();
   if (kpi === 'retard') loadRetard();
-  if (kpi === 'depenses') loadDepenses();
+  if (kpi === 'sales') loadSales();
 }
 
 function setChartPeriod(chart, period, btn) {
@@ -465,94 +670,163 @@ function setChartPeriod(chart, period, btn) {
   btn.closest('.local-filters').querySelectorAll('.local-filter-btn').forEach(b => b.classList.remove('active'));
   btn.classList.add('active');
   if (chart === 'ca') loadCA();
-  if (chart === 'dep') loadDepenses();
+  if (chart === 'sales' || chart === 'salesTable') loadSales();
   if (chart === 'retardTable') loadRetard();
 }
 
 async function loadCA() {
-  const compare = document.getElementById('compareCA').checked;
-  const [chartData, kpiData] = await Promise.all([
-    fetch(`/api/ca?period=${periods.ca}`).then(r => r.json()),
-    fetch(`/api/ca?period=${localKpi.ca}`).then(r => r.json()),
-  ]);
-  document.getElementById('kpiCA').textContent = fmt(kpiData.total);
-  document.getElementById('kpiCASub').textContent = `${kpiData.labels.length} client(s) — ${kpiData.period_label}`;
-  document.getElementById('kpiCAPct').innerHTML = pctBadge(kpiData.pct);
-  document.getElementById('caChartSub').textContent = `Top 10 clients — ${chartData.period_label}`;
-  if (chartCA) chartCA.destroy();
-  const datasets = [{ label: 'Période actuelle', data: chartData.values, backgroundColor: 'rgba(79,142,247,0.7)', borderColor: 'rgba(79,142,247,1)', borderWidth: 1, borderRadius: 4 }];
-  if (compare) datasets.push({ label: 'Année précédente', data: chartData.prev_values, backgroundColor: 'rgba(79,142,247,0.2)', borderColor: 'rgba(79,142,247,0.5)', borderWidth: 1, borderRadius: 4 });
-  chartCA = new Chart(document.getElementById('chartCA'), {
-    type: 'bar', data: { labels: chartData.labels, datasets },
-    options: { responsive: true, plugins: { legend: { display: compare, labels: { color: '#8890a8', font: { size: 11 } } } }, scales: { x: { ticks: { color: '#8890a8', font: { size: 10 } }, grid: { color: '#2a2f45' } }, y: { ticks: { color: '#8890a8', font: { size: 10 }, callback: v => fmt(v) }, grid: { color: '#2a2f45' } } } }
-  });
+  try {
+    const compare = document.getElementById('compareCA').checked;
+    const [chartData, kpiData] = await Promise.all([
+      fetchJson(`/api/ca?period=${periods.ca}`),
+      fetchJson(`/api/ca?period=${localKpi.ca}`),
+    ]);
+    document.getElementById('kpiCA').textContent = fmt(kpiData.total);
+    document.getElementById('kpiCASub').textContent = `${chartData.labels.length} client(s) — ${kpiData.period_label}`;
+    document.getElementById('kpiCAPct').innerHTML = pctBadge(kpiData.pct);
+    document.getElementById('caChartSub').textContent = `Top 10 clients — ${chartData.period_label}`;
+    if (chartCA) chartCA.destroy();
+    const datasets = [{ label: 'Période actuelle', data: chartData.values, backgroundColor: 'rgba(79,142,247,0.7)', borderColor: 'rgba(79,142,247,1)', borderWidth: 1, borderRadius: 4 }];
+    if (compare) datasets.push({ label: 'Année précédente', data: chartData.prev_values, backgroundColor: 'rgba(79,142,247,0.2)', borderColor: 'rgba(79,142,247,0.5)', borderWidth: 1, borderRadius: 4 });
+    chartCA = new Chart(document.getElementById('chartCA'), {
+      type: 'bar', data: { labels: chartData.labels, datasets },
+      options: { responsive: true, plugins: { legend: { display: compare, labels: { color: '#8890a8', font: { size: 11 } } } }, scales: { x: { ticks: { color: '#8890a8', font: { size: 10 } }, grid: { color: '#2a2f45' } }, y: { ticks: { color: '#8890a8', font: { size: 10 }, callback: v => fmt(v) }, grid: { color: '#2a2f45' } } } }
+    });
+  } catch (error) {
+    showError('chartCA', error);
+    document.getElementById('kpiCASub').textContent = 'Erreur';
+  }
 }
 
-async function loadDepenses() {
-  const compare = document.getElementById('compareDep').checked;
-  const [chartData, kpiData] = await Promise.all([
-    fetch(`/api/depenses?period=${periods.dep}`).then(r => r.json()),
-    fetch(`/api/depenses?period=${localKpi.depenses}`).then(r => r.json()),
-  ]);
-  document.getElementById('kpiDepenses').textContent = fmt(kpiData.total);
-  document.getElementById('kpiDepensesSub').textContent = `${kpiData.labels.length} compte(s) — ${kpiData.period_label}`;
-  document.getElementById('kpiDepensesPct').innerHTML = pctBadge(kpiData.pct);
-  document.getElementById('depChartSub').textContent = `Top 10 comptes — ${chartData.period_label}`;
-  if (chartDep) chartDep.destroy();
-  const colors = ['rgba(79,142,247,0.8)','rgba(79,247,160,0.8)','rgba(247,99,79,0.8)','rgba(247,196,79,0.8)','rgba(160,79,247,0.8)','rgba(79,220,247,0.8)','rgba(247,79,196,0.8)','rgba(130,247,79,0.8)','rgba(247,150,79,0.8)','rgba(79,100,247,0.8)'];
-  const datasets = [{ label: 'Période actuelle', data: chartData.values, backgroundColor: compare ? 'rgba(79,142,247,0.7)' : colors, borderWidth: 0 }];
-  if (compare) datasets.push({ label: 'Année précédente', data: chartData.prev_values, backgroundColor: 'rgba(136,144,168,0.3)', borderWidth: 0 });
-  chartDep = new Chart(document.getElementById('chartDep'), {
-    type: compare ? 'bar' : 'doughnut', data: { labels: chartData.labels, datasets },
-    options: { responsive: true, plugins: { legend: { position: compare ? 'top' : 'right', labels: { color: '#8890a8', font: { size: 11 }, boxWidth: 12 } } }, ...(compare ? { scales: { x: { ticks: { color: '#8890a8', font: { size: 10 } }, grid: { color: '#2a2f45' } }, y: { ticks: { color: '#8890a8', font: { size: 10 }, callback: v => fmt(v) }, grid: { color: '#2a2f45' } } } } : {}) }
-  });
+async function loadSales() {
+  try {
+    const compare = document.getElementById('compareSales').checked;
+    const [chartData, kpiData, tableData] = await Promise.all([
+      fetchJson(`/api/sales?period=${periods.sales}`),
+      fetchJson(`/api/sales?period=${localKpi.sales}`),
+      fetchJson(`/api/sales?period=${periods.salesTable}`),
+    ]);
+    document.getElementById('kpiSales').textContent = fmt(kpiData.total);
+    document.getElementById('kpiSalesSub').textContent = `${kpiData.quote_count} devis + ${kpiData.order_count} commande(s) — ${kpiData.period_label}`;
+    document.getElementById('kpiSalesPct').innerHTML = pctBadge(kpiData.pct);
+    document.getElementById('salesChartSub').textContent = `Montants HTVA — ${chartData.period_label}`;
+    document.getElementById('salesTableSub').textContent = `Devis en cours et bons à facturer — ${tableData.period_label}`;
+
+    if (chartSales) chartSales.destroy();
+    const datasets = [{ label: 'Période actuelle', data: chartData.values, backgroundColor: ['rgba(79,142,247,0.75)','rgba(79,247,160,0.75)'], borderRadius: 6 }];
+    if (compare) datasets.push({ label: 'Année précédente', data: chartData.prev_values, backgroundColor: ['rgba(79,142,247,0.25)','rgba(79,247,160,0.25)'], borderRadius: 6 });
+    chartSales = new Chart(document.getElementById('chartSales'), {
+      type: 'bar',
+      data: { labels: chartData.labels, datasets },
+      options: { responsive: true, plugins: { legend: { display: compare, labels: { color: '#8890a8', font: { size: 11 } } } }, scales: { x: { ticks: { color: '#8890a8', font: { size: 10 } }, grid: { color: '#2a2f45' } }, y: { ticks: { color: '#8890a8', font: { size: 10 }, callback: v => fmt(v) }, grid: { color: '#2a2f45' } } } }
+    });
+
+    const renderSection = (title, rows, statusClass) => {
+      if (!rows.length) return `<div><div class="mini-table-title">${title}</div><div class="empty-state">Aucun élément sur la période</div></div>`;
+      let html = `<div><div class="mini-table-title">${title}</div><table><thead><tr><th>Numéro</th><th>Client</th><th>Montant</th><th>Date</th><th>Statut</th></tr></thead><tbody>`;
+      for (const r of rows) {
+        html += `<tr><td><span style="font-family:monospace;font-size:12px;color:#8890a8">${r.numero}</span></td><td>${r.client}</td><td><span class="montant">${fmt(r.montant)}</span></td><td><span style="font-family:monospace;font-size:12px">${r.date || '—'}</span></td><td><span class="status-badge ${statusClass}">${r.invoice_status_label}</span></td></tr>`;
+      }
+      html += '</tbody></table></div>';
+      return html;
+    };
+
+    document.getElementById('tableSales').innerHTML = `<div class="split-list">${renderSection('Devis en cours', tableData.quotes, '')}${renderSection('Bons à facturer', tableData.orders, 'success-badge')}</div>`;
+  } catch (error) {
+    showError('chartSales', error);
+    showError('tableSales', error);
+    document.getElementById('kpiSalesSub').textContent = 'Erreur';
+  }
 }
 
 async function loadRetard() {
-  const [tableData, kpiData] = await Promise.all([
-    fetch(`/api/retard?period=${periods.retardTable}`).then(r => r.json()),
-    fetch(`/api/retard?period=${localKpi.retard}`).then(r => r.json()),
-  ]);
-  document.getElementById('kpiRetard').textContent = fmt(kpiData.total);
-  document.getElementById('kpiRetardSub').textContent = `${kpiData.count} facture(s) — ${kpiData.period_label}`;
-  document.getElementById('kpiRetardPct').innerHTML = pctBadge(kpiData.pct);
-  document.getElementById('retardTableSub').textContent = `Factures en retard — ${tableData.period_label}`;
-  if (tableData.factures.length === 0) { document.getElementById('tableRetard').innerHTML = '<div class="loading">✅ Aucune facture en retard</div>'; return; }
-  let html = `<table><thead><tr><th>Numéro</th><th>Client</th><th>Montant dû</th><th>Échéance</th><th>Retard</th></tr></thead><tbody>`;
-  for (const f of tableData.factures) {
-    const cls = f.retard_jours > 60 ? 'retard-high' : f.retard_jours > 30 ? 'retard-mid' : 'retard-low';
-    html += `<tr><td><span style="font-family:monospace;font-size:12px;color:#8890a8">${f.numero}</span></td><td>${f.client}</td><td><span class="montant">${fmt(f.montant)}</span></td><td><span style="font-family:monospace;font-size:12px">${f.echeance}</span></td><td><span class="retard-badge ${cls}">+${f.retard_jours}j</span></td></tr>`;
+  try {
+    const [tableData, kpiData] = await Promise.all([
+      fetchJson(`/api/retard?period=${periods.retardTable}`),
+      fetchJson(`/api/retard?period=${localKpi.retard}`),
+    ]);
+    document.getElementById('kpiRetard').textContent = fmt(kpiData.total);
+    document.getElementById('kpiRetardSub').textContent = `${kpiData.count} facture(s) — ${kpiData.period_label}`;
+    document.getElementById('kpiRetardPct').innerHTML = pctBadge(kpiData.pct);
+    document.getElementById('retardTableSub').textContent = `Factures en retard — ${tableData.period_label}`;
+    if (tableData.factures.length === 0) {
+      document.getElementById('tableRetard').innerHTML = '<div class="empty-state">✅ Aucune facture en retard</div>';
+      return;
+    }
+    let html = `<table><thead><tr><th>Numéro</th><th>Client</th><th>Montant dû</th><th>Échéance</th><th>Retard</th></tr></thead><tbody>`;
+    for (const f of tableData.factures) {
+      const cls = f.retard_jours > 60 ? 'retard-high' : f.retard_jours > 30 ? 'retard-mid' : 'retard-low';
+      html += `<tr><td><span style="font-family:monospace;font-size:12px;color:#8890a8">${f.numero}</span></td><td>${f.client}</td><td><span class="montant">${fmt(f.montant)}</span></td><td><span style="font-family:monospace;font-size:12px">${f.echeance}</span></td><td><span class="retard-badge ${cls}">+${f.retard_jours}j</span></td></tr>`;
+    }
+    html += '</tbody></table>';
+    document.getElementById('tableRetard').innerHTML = html;
+  } catch (error) {
+    showError('tableRetard', error);
+    document.getElementById('kpiRetardSub').textContent = 'Erreur';
   }
-  html += '</tbody></table>';
-  document.getElementById('tableRetard').innerHTML = html;
+}
+
+function refreshAll() {
+  fetchJson('/api/health?clear_cache=1').finally(() => loadAll());
 }
 
 async function loadAll() {
   document.getElementById('dateBadge').textContent = new Date().toLocaleDateString('fr-BE', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' });
-  await Promise.all([loadCA(), loadDepenses(), loadRetard()]);
+  await Promise.all([loadCA(), loadSales(), loadRetard()]);
 }
 
-loadAll();
+window.addEventListener('DOMContentLoaded', () => {
+  document.querySelectorAll('.local-filter-btn').forEach(btn => {
+    const onclick = btn.getAttribute('onclick') || '';
+    if (onclick.includes("'ca'")) btn.dataset.scope = 'ca-chart';
+    if (onclick.includes("'sales'")) btn.dataset.scope = 'sales-chart';
+    if (onclick.includes("'retardTable'")) btn.dataset.scope = 'retard-table';
+    if (onclick.includes("'salesTable'")) btn.dataset.scope = 'sales-table';
+    const match = onclick.match(/'([^']+)'\)/g);
+    if (match && match.length >= 1) {
+      btn.dataset.period = match[0].replace(/[\'\)]/g, '');
+    }
+  });
+  loadAll();
+});
 </script>
 </body>
 </html>
 """
 
+
 @app.route("/")
 def index():
     return render_template_string(HTML, db=ODOO_DB)
+
+
+@app.route("/api/health")
+def api_health():
+    if request.args.get("clear_cache") == "1":
+        _cache.clear()
+    return jsonify({"ok": True, "cache_entries": len(_cache)})
+
 
 @app.route("/api/ca")
 def api_ca():
     return jsonify(get_ca(request.args.get("period", "month")))
 
-@app.route("/api/depenses")
-def api_depenses():
-    return jsonify(get_depenses(request.args.get("period", "month")))
 
 @app.route("/api/retard")
 def api_retard():
     return jsonify(get_factures_retard(request.args.get("period", "month")))
+
+
+@app.route("/api/sales")
+def api_sales():
+    return jsonify(get_sales_pipeline(request.args.get("period", "month")))
+
+
+@app.errorhandler(Exception)
+def handle_error(error):
+    code = getattr(error, "code", 500)
+    return jsonify({"error": str(error)}), code
+
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
