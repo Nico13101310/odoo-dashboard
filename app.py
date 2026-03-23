@@ -184,7 +184,10 @@ def build_partner_domain(partner_id):
         pid = int(partner_id)
     except (TypeError, ValueError) as exc:
         raise OdooDashboardError("partner_id invalide.") from exc
-    return [["commercial_partner_id", "=", pid]]
+    # On évite commercial_partner_id ici car le champ n'existe pas sur tous les modèles
+    # (ex: sale.order). Le domain child_of sur partner_id est plus robuste pour couvrir
+    # la société sélectionnée et ses contacts éventuels.
+    return [["partner_id", "child_of", pid]]
 
 
 def search_read_all(model, domain, fields, order=None, limit=ODOO_PAGE_SIZE):
