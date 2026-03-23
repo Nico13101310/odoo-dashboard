@@ -1,3 +1,4 @@
+
 from flask import Flask, render_template_string, jsonify, request
 import os
 import ssl
@@ -97,10 +98,23 @@ def execute_kw(model, method, args=None, kwargs=None):
         raise OdooDashboardError(f"Erreur réseau Odoo ({model}.{method}) : {exc}") from exc
 
 
-VALID_PERIODS = {"today", "week", "month", "quarter", "year"}
+VALID_PERIODS = {"today", "week", "month", "quarter", "year", "custom"}
 
 
-def get_period_dates(period):
+def parse_custom_dates(date_from=None, date_to=None):
+    if not date_from or not date_to:
+        raise OdooDashboardError("Pour la période personnalisée, une date de début et une date de fin sont requises.")
+    try:
+        start = datetime.strptime(date_from, "%Y-%m-%d").date()
+        end = datetime.strptime(date_to, "%Y-%m-%d").date()
+    except ValueError as exc:
+        raise OdooDashboardError("Format de date invalide. Utilise YYYY-MM-DD.") from exc
+    if end < start:
+        raise OdooDashboardError("La date de fin doit être postérieure ou égale à la date de début.")
+    return start, end
+
+
+def get_period_dates(period, date_from=None, date_to=None):
     period = period if period in VALID_PERIODS else "month"
     today = date.today()
     if period == "today":
@@ -114,11 +128,13 @@ def get_period_dates(period):
         q = (today.month - 1) // 3
         start = date(today.year, q * 3 + 1, 1)
         return start, today
-    return today.replace(month=1, day=1), today
+    if period == "year":
+        return today.replace(month=1, day=1), today
+    return parse_custom_dates(date_from, date_to)
 
 
-def get_prev_period_dates(period):
-    start, end = get_period_dates(period)
+def get_prev_period_dates(period, date_from=None, date_to=None):
+    start, end = get_period_dates(period, date_from, date_to)
     return start - relativedelta(years=1), end - relativedelta(years=1)
 
 
@@ -154,10 +170,6 @@ def summarize_top_items(mapping, limit=5):
     return top
 
 
-def get_odoo_record_url(model, record_id):
-    return f"{ODOO_URL}/web#id={record_id}&model={model}&view_type=form"
-
-
 def search_read_all(model, domain, fields, order=None, limit=ODOO_PAGE_SIZE):
     records = []
     offset = 0
@@ -178,6 +190,16 @@ def search_read_all(model, domain, fields, order=None, limit=ODOO_PAGE_SIZE):
             break
         offset += limit
     return records
+
+
+def make_period_label(start, end, period):
+    if period == "custom":
+        return f"Personnalisé — {start} → {end}"
+    return f"{start} → {end}"
+
+
+def get_odoo_record_url(model, record_id):
+    return f"{ODOO_URL}/web#id={record_id}&model={model}&view_type=form"
 
 
 @cached()
@@ -201,9 +223,9 @@ def fetch_ca(date_debut, date_fin):
 
 
 @cached()
-def get_ca(period):
-    start, end = get_period_dates(period)
-    prev_start, prev_end = get_prev_period_dates(period)
+def get_ca(period, date_from=None, date_to=None):
+    start, end = get_period_dates(period, date_from, date_to)
+    prev_start, prev_end = get_prev_period_dates(period, date_from, date_to)
     current = fetch_ca(start, end)
     previous = fetch_ca(prev_start, prev_end)
     total_current = round(sum(current.values()), 2)
@@ -218,15 +240,15 @@ def get_ca(period):
         "total": total_current,
         "total_prev": total_previous,
         "pct": pct_change(total_current, total_previous),
-        "period_label": f"{start} → {end}",
-        "prev_period_label": f"{prev_start} → {prev_end}",
+        "period_label": make_period_label(start, end, period),
+        "prev_period_label": make_period_label(prev_start, prev_end, period),
     }
 
 
 @cached()
-def get_factures_retard(period):
-    start, end = get_period_dates(period)
-    prev_start, prev_end = get_prev_period_dates(period)
+def get_factures_retard(period, date_from=None, date_to=None):
+    start, end = get_period_dates(period, date_from, date_to)
+    prev_start, prev_end = get_prev_period_dates(period, date_from, date_to)
     today = date.today()
 
     def fetch(d_start, d_end):
@@ -253,15 +275,6 @@ def get_factures_retard(period):
                 continue
             due = datetime.strptime(due_raw, "%Y-%m-%d").date()
             retard = (today - due).days
-            if retard > 60:
-                priority_label = "Critique"
-                priority_class = "retard-high"
-            elif retard > 30:
-                priority_label = "Haute"
-                priority_class = "retard-mid"
-            else:
-                priority_label = "Normale"
-                priority_class = "retard-low"
             result.append({
                 "id": inv.get("id"),
                 "numero": inv.get("name") or "—",
@@ -269,9 +282,8 @@ def get_factures_retard(period):
                 "montant": round(inv.get("amount_residual") or 0, 2),
                 "echeance": due_raw,
                 "retard_jours": retard,
-                "priority_label": priority_label,
-                "priority_class": priority_class,
-                "url": get_odoo_record_url("account.move", inv.get("id")),
+                "priority": "Critique" if retard > 60 else "Haute" if retard > 30 else "Normale",
+                "url": get_odoo_record_url("account.move", inv.get("id")) if inv.get("id") else None,
             })
         result.sort(key=lambda x: x["retard_jours"], reverse=True)
         return result
@@ -287,8 +299,8 @@ def get_factures_retard(period):
         "total_prev": total_previous,
         "count_prev": len(previous_list),
         "pct": pct_change(total_current, total_previous),
-        "period_label": f"{start} → {end}",
-        "prev_period_label": f"{prev_start} → {prev_end}",
+        "period_label": make_period_label(start, end, period),
+        "prev_period_label": make_period_label(prev_start, prev_end, period),
     }
 
 
@@ -334,7 +346,7 @@ def fetch_sales_pipeline(date_debut, date_fin):
                 "state_label": label_for_status(rec.get("state")),
                 "invoice_status": rec.get("invoice_status") or "",
                 "invoice_status_label": label_for_status(rec.get("invoice_status")),
-                "url": get_odoo_record_url("sale.order", rec.get("id")),
+                "url": get_odoo_record_url("sale.order", rec.get("id")) if rec.get("id") else None,
             })
         return rows
 
@@ -352,9 +364,9 @@ def fetch_sales_pipeline(date_debut, date_fin):
 
 
 @cached()
-def get_sales_pipeline(period):
-    start, end = get_period_dates(period)
-    prev_start, prev_end = get_prev_period_dates(period)
+def get_sales_pipeline(period, date_from=None, date_to=None):
+    start, end = get_period_dates(period, date_from, date_to)
+    prev_start, prev_end = get_prev_period_dates(period, date_from, date_to)
 
     current = fetch_sales_pipeline(start, end)
     previous = fetch_sales_pipeline(prev_start, prev_end)
@@ -382,8 +394,8 @@ def get_sales_pipeline(period):
         "order_pct": pct_change(current["order_total"], previous["order_total"]),
         "quotes": current["quotes"],
         "orders": current["orders"],
-        "period_label": f"{start} → {end}",
-        "prev_period_label": f"{prev_start} → {prev_end}",
+        "period_label": make_period_label(start, end, period),
+        "prev_period_label": make_period_label(prev_start, prev_end, period),
     }
 
 
@@ -410,15 +422,28 @@ HTML = """
   .logo-icon { width: 36px; height: 36px; background: var(--accent); border-radius: 8px; display: flex; align-items: center; justify-content: center; font-size: 18px; }
   .logo-text { font-size: 18px; font-weight: 600; }
   .logo-sub { font-size: 12px; color: var(--text2); font-family: 'DM Mono', monospace; }
-  .global-filters { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  .header-controls { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; justify-content: flex-end; }
+  .global-filter-wrap { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
   .filter-label { font-size: 12px; color: var(--text2); margin-right: 4px; }
   .filter-btn { background: var(--bg); border: 1px solid var(--border); color: var(--text2); padding: 6px 12px; border-radius: 6px; font-size: 12px; cursor: pointer; font-family: 'DM Sans', sans-serif; transition: all 0.15s; }
   .filter-btn:hover { border-color: var(--accent); color: var(--text); }
   .filter-btn.active { background: var(--accent); border-color: var(--accent); color: white; }
-  .header-right { display: flex; align-items: center; gap: 10px; }
+  .custom-range { display: none; align-items: center; gap: 8px; flex-wrap: wrap; padding: 8px 10px; background: var(--bg); border: 1px solid var(--border); border-radius: 8px; }
+  .custom-range.visible { display: flex; }
+  .date-input {
+    background: var(--surface2); color: var(--text); border: 1px solid var(--border);
+    padding: 7px 10px; border-radius: 6px; font-size: 12px; font-family: 'DM Sans', sans-serif;
+  }
+  .checkbox-wrap { display: flex; align-items: center; gap: 6px; padding: 8px 10px; background: var(--bg); border: 1px solid var(--border); border-radius: 8px; }
+  .checkbox-wrap label { font-size: 12px; color: var(--text2); cursor: pointer; }
+  .checkbox-wrap input { accent-color: var(--accent); cursor: pointer; }
   .date-badge { font-family: 'DM Mono', monospace; font-size: 11px; color: var(--text2); background: var(--bg); padding: 6px 10px; border-radius: 6px; border: 1px solid var(--border); }
-  .refresh-btn { background: var(--surface2); color: var(--text); border: 1px solid var(--border); padding: 7px 14px; border-radius: 6px; font-size: 12px; font-weight: 500; cursor: pointer; font-family: 'DM Sans', sans-serif; transition: all 0.15s; }
-  .refresh-btn:hover { border-color: var(--accent); color: var(--accent); }
+  .refresh-btn, .apply-btn {
+    background: var(--surface2); color: var(--text); border: 1px solid var(--border);
+    padding: 7px 14px; border-radius: 6px; font-size: 12px; font-weight: 500; cursor: pointer;
+    font-family: 'DM Sans', sans-serif; transition: all 0.15s;
+  }
+  .refresh-btn:hover, .apply-btn:hover { border-color: var(--accent); color: var(--accent); }
   main { padding: 28px 40px; max-width: 1400px; margin: 0 auto; }
   .kpi-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 16px; margin-bottom: 28px; }
   .kpi-card { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 22px; position: relative; overflow: hidden; }
@@ -428,10 +453,6 @@ HTML = """
   .kpi-card.green::before { background: var(--accent3); }
   .kpi-top { display: flex; align-items: flex-start; justify-content: space-between; margin-bottom: 10px; }
   .kpi-label { font-size: 11px; color: var(--text2); text-transform: uppercase; letter-spacing: 1px; font-weight: 500; }
-  .kpi-local-filter { display: flex; gap: 4px; }
-  .kpi-filter-btn { background: none; border: 1px solid var(--border); color: var(--text2); padding: 2px 7px; border-radius: 4px; font-size: 10px; cursor: pointer; font-family: 'DM Sans', sans-serif; transition: all 0.15s; }
-  .kpi-filter-btn:hover { border-color: var(--accent); color: var(--accent); }
-  .kpi-filter-btn.active { background: var(--accent); border-color: var(--accent); color: white; }
   .kpi-value { font-size: 28px; font-weight: 600; letter-spacing: -0.5px; margin-bottom: 6px; }
   .kpi-value.blue { color: var(--accent); }
   .kpi-value.red { color: var(--accent2); }
@@ -447,13 +468,6 @@ HTML = """
   .card-header { display: flex; align-items: flex-start; justify-content: space-between; margin-bottom: 16px; gap: 12px; }
   .card-title { font-size: 14px; font-weight: 600; margin-bottom: 3px; }
   .card-sub { font-size: 11px; color: var(--text2); font-family: 'DM Mono', monospace; }
-  .local-filters { display: flex; gap: 4px; flex-wrap: wrap; justify-content: flex-end; }
-  .local-filter-btn { background: none; border: 1px solid var(--border); color: var(--text2); padding: 3px 8px; border-radius: 4px; font-size: 11px; cursor: pointer; font-family: 'DM Sans', sans-serif; transition: all 0.15s; }
-  .local-filter-btn:hover { border-color: var(--accent); color: var(--accent); }
-  .local-filter-btn.active { background: var(--accent); border-color: var(--accent); color: white; }
-  .compare-toggle { display: flex; align-items: center; gap: 6px; margin-top: 6px; justify-content: flex-end; }
-  .compare-toggle label { font-size: 11px; color: var(--text2); cursor: pointer; }
-  .compare-toggle input { cursor: pointer; accent-color: var(--accent); }
   canvas { max-height: 240px; }
   .table-card { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 22px; margin-bottom: 20px; }
   table { width: 100%; border-collapse: collapse; margin-top: 4px; }
@@ -461,26 +475,28 @@ HTML = """
   tbody tr { border-bottom: 1px solid var(--border); transition: background 0.15s; }
   tbody tr:hover { background: var(--surface2); }
   tbody tr:last-child { border-bottom: none; }
-  tbody td { padding: 11px 12px; font-size: 13px; }
+  tbody td { padding: 11px 12px; font-size: 13px; vertical-align: middle; }
   .retard-badge { display: inline-block; padding: 2px 8px; border-radius: 4px; font-family: 'DM Mono', monospace; font-size: 11px; font-weight: 500; }
   .retard-low { background: rgba(247,196,79,0.15); color: var(--warning); }
   .retard-mid { background: rgba(247,99,79,0.15); color: var(--danger); }
   .retard-high { background: rgba(247,99,79,0.3); color: var(--danger); }
   .status-badge { display: inline-block; padding: 2px 8px; border-radius: 4px; font-family: 'DM Mono', monospace; font-size: 11px; font-weight: 500; background: rgba(79,142,247,0.15); color: var(--accent); }
   .success-badge { background: rgba(79,247,160,0.15); color: var(--success); }
+  .danger-badge { background: rgba(247,99,79,0.15); color: var(--danger); }
   .warning-badge { background: rgba(247,196,79,0.15); color: var(--warning); }
-  .danger-badge { background: rgba(247,99,79,0.18); color: var(--danger); }
-  .action-link { display: inline-block; padding: 5px 9px; border: 1px solid var(--border); border-radius: 6px; color: var(--text); text-decoration: none; font-size: 11px; transition: all 0.15s; }
-  .action-link:hover { border-color: var(--accent); color: var(--accent); }
   .montant { font-family: 'DM Mono', monospace; font-size: 13px; font-weight: 500; }
   .loading, .empty-state, .error-state { display: flex; align-items: center; justify-content: center; min-height: 160px; color: var(--text2); font-size: 13px; gap: 10px; text-align: center; padding: 20px; }
   .error-state { color: #ffb4a7; }
   .spinner { width: 16px; height: 16px; border: 2px solid var(--border); border-top-color: var(--accent); border-radius: 50%; animation: spin 0.8s linear infinite; }
   .split-list { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
   .mini-table-title { font-size: 12px; font-weight: 600; margin-bottom: 8px; color: var(--text); }
+  .table-link { color: var(--accent); text-decoration: none; font-size: 12px; font-weight: 500; }
+  .table-link:hover { text-decoration: underline; }
   @keyframes spin { to { transform: rotate(360deg); } }
-  @media (max-width: 900px) {
+  @media (max-width: 1100px) {
     .kpi-grid, .charts-grid, .split-list { grid-template-columns: 1fr; }
+  }
+  @media (max-width: 900px) {
     main { padding: 16px; }
     header { padding: 16px; }
   }
@@ -495,15 +511,30 @@ HTML = """
       <div class="logo-sub">{{ db }}</div>
     </div>
   </div>
-  <div class="global-filters">
-    <span class="filter-label">Période globale :</span>
-    <button class="filter-btn" data-period="today" onclick="setGlobal('today')">Aujourd'hui</button>
-    <button class="filter-btn" data-period="week" onclick="setGlobal('week')">Semaine</button>
-    <button class="filter-btn active" data-period="month" onclick="setGlobal('month')">Mois</button>
-    <button class="filter-btn" data-period="quarter" onclick="setGlobal('quarter')">Trimestre</button>
-    <button class="filter-btn" data-period="year" onclick="setGlobal('year')">Année</button>
-  </div>
-  <div class="header-right">
+
+  <div class="header-controls">
+    <div class="global-filter-wrap">
+      <span class="filter-label">Période :</span>
+      <button class="filter-btn" data-period="today" onclick="setGlobalPeriod('today')">Aujourd'hui</button>
+      <button class="filter-btn" data-period="week" onclick="setGlobalPeriod('week')">Semaine</button>
+      <button class="filter-btn active" data-period="month" onclick="setGlobalPeriod('month')">Mois</button>
+      <button class="filter-btn" data-period="quarter" onclick="setGlobalPeriod('quarter')">Trimestre</button>
+      <button class="filter-btn" data-period="year" onclick="setGlobalPeriod('year')">Année</button>
+      <button class="filter-btn" data-period="custom" onclick="setGlobalPeriod('custom')">Personnalisé</button>
+    </div>
+
+    <div class="custom-range" id="customRange">
+      <input class="date-input" type="date" id="dateFrom">
+      <span style="color: var(--text2); font-size: 12px;">→</span>
+      <input class="date-input" type="date" id="dateTo">
+      <button class="apply-btn" onclick="applyCustomRange()">Appliquer</button>
+    </div>
+
+    <div class="checkbox-wrap">
+      <input type="checkbox" id="compareGlobal" checked onchange="loadAll()">
+      <label for="compareGlobal">Comparer à N-1</label>
+    </div>
+
     <div class="date-badge" id="dateBadge">—</div>
     <button class="refresh-btn" onclick="refreshAll()">↻ Actualiser</button>
   </div>
@@ -512,14 +543,7 @@ HTML = """
 <main>
   <div class="kpi-grid">
     <div class="kpi-card blue">
-      <div class="kpi-top">
-        <div class="kpi-label">CA</div>
-        <div class="kpi-local-filter">
-          <button class="kpi-filter-btn active" onclick="setLocalKpi('ca','month',this)">M</button>
-          <button class="kpi-filter-btn" onclick="setLocalKpi('ca','quarter',this)">T</button>
-          <button class="kpi-filter-btn" onclick="setLocalKpi('ca','year',this)">A</button>
-        </div>
-      </div>
+      <div class="kpi-top"><div class="kpi-label">CA</div></div>
       <div class="kpi-value blue" id="kpiCA">—</div>
       <div class="kpi-bottom">
         <div class="kpi-sub" id="kpiCASub">Chargement...</div>
@@ -527,14 +551,7 @@ HTML = """
       </div>
     </div>
     <div class="kpi-card red">
-      <div class="kpi-top">
-        <div class="kpi-label">Factures en retard</div>
-        <div class="kpi-local-filter">
-          <button class="kpi-filter-btn active" onclick="setLocalKpi('retard','month',this)">M</button>
-          <button class="kpi-filter-btn" onclick="setLocalKpi('retard','quarter',this)">T</button>
-          <button class="kpi-filter-btn" onclick="setLocalKpi('retard','year',this)">A</button>
-        </div>
-      </div>
+      <div class="kpi-top"><div class="kpi-label">Factures en retard</div></div>
       <div class="kpi-value red" id="kpiRetard">—</div>
       <div class="kpi-bottom">
         <div class="kpi-sub" id="kpiRetardSub">Chargement...</div>
@@ -542,14 +559,7 @@ HTML = """
       </div>
     </div>
     <div class="kpi-card green">
-      <div class="kpi-top">
-        <div class="kpi-label">Devis en cours</div>
-        <div class="kpi-local-filter">
-          <button class="kpi-filter-btn active" onclick="setLocalKpi('sales','month',this)">M</button>
-          <button class="kpi-filter-btn" onclick="setLocalKpi('sales','quarter',this)">T</button>
-          <button class="kpi-filter-btn" onclick="setLocalKpi('sales','year',this)">A</button>
-        </div>
-      </div>
+      <div class="kpi-top"><div class="kpi-label">Devis en cours</div></div>
       <div class="kpi-value green" id="kpiQuotes">—</div>
       <div class="kpi-bottom">
         <div class="kpi-sub" id="kpiQuotesSub">Chargement...</div>
@@ -557,14 +567,7 @@ HTML = """
       </div>
     </div>
     <div class="kpi-card green">
-      <div class="kpi-top">
-        <div class="kpi-label">Bons à facturer</div>
-        <div class="kpi-local-filter">
-          <button class="kpi-filter-btn active" onclick="setLocalKpi('sales','month',this)">M</button>
-          <button class="kpi-filter-btn" onclick="setLocalKpi('sales','quarter',this)">T</button>
-          <button class="kpi-filter-btn" onclick="setLocalKpi('sales','year',this)">A</button>
-        </div>
-      </div>
+      <div class="kpi-top"><div class="kpi-label">Bons à facturer</div></div>
       <div class="kpi-value green" id="kpiOrders">—</div>
       <div class="kpi-bottom">
         <div class="kpi-sub" id="kpiOrdersSub">Chargement...</div>
@@ -580,40 +583,15 @@ HTML = """
           <div class="card-title">Chiffre d'affaires</div>
           <div class="card-sub" id="caChartSub">Top 5 clients + autres</div>
         </div>
-        <div>
-          <div class="local-filters">
-            <button class="local-filter-btn" onclick="setChartPeriod('ca','today',this)">Jour</button>
-            <button class="local-filter-btn" onclick="setChartPeriod('ca','week',this)">Semaine</button>
-            <button class="local-filter-btn active" onclick="setChartPeriod('ca','month',this)">Mois</button>
-            <button class="local-filter-btn" onclick="setChartPeriod('ca','quarter',this)">Trimestre</button>
-            <button class="local-filter-btn" onclick="setChartPeriod('ca','year',this)">Année</button>
-          </div>
-          <div class="compare-toggle">
-            <input type="checkbox" id="compareCA" onchange="loadCA()">
-            <label for="compareCA">vs année précédente</label>
-          </div>
-        </div>
       </div>
       <canvas id="chartCA"></canvas>
     </div>
+
     <div class="chart-card">
       <div class="card-header">
         <div>
           <div class="card-title">Devis et bons à facturer</div>
           <div class="card-sub" id="salesChartSub">Montants HTVA</div>
-        </div>
-        <div>
-          <div class="local-filters">
-            <button class="local-filter-btn" onclick="setChartPeriod('sales','today',this)">Jour</button>
-            <button class="local-filter-btn" onclick="setChartPeriod('sales','week',this)">Semaine</button>
-            <button class="local-filter-btn active" onclick="setChartPeriod('sales','month',this)">Mois</button>
-            <button class="local-filter-btn" onclick="setChartPeriod('sales','quarter',this)">Trimestre</button>
-            <button class="local-filter-btn" onclick="setChartPeriod('sales','year',this)">Année</button>
-          </div>
-          <div class="compare-toggle">
-            <input type="checkbox" id="compareSales" onchange="loadSales()">
-            <label for="compareSales">vs année précédente</label>
-          </div>
         </div>
       </div>
       <canvas id="chartSales"></canvas>
@@ -626,13 +604,6 @@ HTML = """
         <div class="card-title">Factures en retard</div>
         <div class="card-sub" id="retardTableSub">Factures impayées dont l'échéance est dépassée</div>
       </div>
-      <div class="local-filters">
-        <button class="local-filter-btn" onclick="setChartPeriod('retardTable','today',this)">Jour</button>
-        <button class="local-filter-btn" onclick="setChartPeriod('retardTable','week',this)">Semaine</button>
-        <button class="local-filter-btn active" onclick="setChartPeriod('retardTable','month',this)">Mois</button>
-        <button class="local-filter-btn" onclick="setChartPeriod('retardTable','quarter',this)">Trimestre</button>
-        <button class="local-filter-btn" onclick="setChartPeriod('retardTable','year',this)">Année</button>
-      </div>
     </div>
     <div id="tableRetard"><div class="loading"><div class="spinner"></div> Chargement...</div></div>
   </div>
@@ -643,13 +614,6 @@ HTML = """
         <div class="card-title">Détail commercial</div>
         <div class="card-sub" id="salesTableSub">Devis en cours et bons à facturer</div>
       </div>
-      <div class="local-filters">
-        <button class="local-filter-btn" onclick="setChartPeriod('salesTable','today',this)">Jour</button>
-        <button class="local-filter-btn" onclick="setChartPeriod('salesTable','week',this)">Semaine</button>
-        <button class="local-filter-btn active" onclick="setChartPeriod('salesTable','month',this)">Mois</button>
-        <button class="local-filter-btn" onclick="setChartPeriod('salesTable','quarter',this)">Trimestre</button>
-        <button class="local-filter-btn" onclick="setChartPeriod('salesTable','year',this)">Année</button>
-      </div>
     </div>
     <div id="tableSales"><div class="loading"><div class="spinner"></div> Chargement...</div></div>
   </div>
@@ -657,8 +621,11 @@ HTML = """
 
 <script>
 let chartCA = null, chartSales = null;
-let periods = { ca: 'month', sales: 'month', retardTable: 'month', salesTable: 'month' };
-let localKpi = { ca: 'month', retard: 'month', sales: 'month' };
+let state = {
+  period: 'month',
+  dateFrom: null,
+  dateTo: null
+};
 
 function fmt(n) {
   return new Intl.NumberFormat('fr-BE', { style: 'currency', currency: 'EUR', maximumFractionDigits: 0 }).format(n || 0);
@@ -684,62 +651,95 @@ function showError(targetId, error) {
   document.getElementById(targetId).innerHTML = `<div class="error-state">⚠️ ${error.message}</div>`;
 }
 
-function activateByPeriod(selector, period) {
-  document.querySelectorAll(selector).forEach(btn => {
+function activateGlobalButtons(period) {
+  document.querySelectorAll('.filter-btn').forEach(btn => {
     btn.classList.toggle('active', btn.dataset.period === period);
   });
 }
 
-function setGlobal(period) {
-  activateByPeriod('.filter-btn', period);
-  periods = { ca: period, sales: period, retardTable: period, salesTable: period };
-  localKpi = { ca: period, retard: period, sales: period };
-  syncButtons();
+function toggleCustomRange(show) {
+  document.getElementById('customRange').classList.toggle('visible', show);
+}
+
+function buildQuery() {
+  const params = new URLSearchParams();
+  params.set('period', state.period);
+  if (state.period === 'custom') {
+    params.set('date_from', state.dateFrom || '');
+    params.set('date_to', state.dateTo || '');
+  }
+  return params.toString();
+}
+
+function setGlobalPeriod(period) {
+  state.period = period;
+  activateGlobalButtons(period);
+  toggleCustomRange(period === 'custom');
+  if (period !== 'custom') {
+    loadAll();
+  }
+}
+
+function applyCustomRange() {
+  const dateFrom = document.getElementById('dateFrom').value;
+  const dateTo = document.getElementById('dateTo').value;
+  state.dateFrom = dateFrom;
+  state.dateTo = dateTo;
   loadAll();
 }
 
-function syncButtons() {
-  document.querySelectorAll('[data-scope="ca-chart"]').forEach(b => b.classList.toggle('active', b.dataset.period === periods.ca));
-  document.querySelectorAll('[data-scope="sales-chart"]').forEach(b => b.classList.toggle('active', b.dataset.period === periods.sales));
-  document.querySelectorAll('[data-scope="retard-table"]').forEach(b => b.classList.toggle('active', b.dataset.period === periods.retardTable));
-  document.querySelectorAll('[data-scope="sales-table"]').forEach(b => b.classList.toggle('active', b.dataset.period === periods.salesTable));
-}
-
-function setLocalKpi(kpi, period, btn) {
-  localKpi[kpi] = period;
-  btn.closest('.kpi-local-filter').querySelectorAll('.kpi-filter-btn').forEach(b => b.classList.remove('active'));
-  btn.classList.add('active');
-  if (kpi === 'ca') loadCA();
-  if (kpi === 'retard') loadRetard();
-  if (kpi === 'sales') loadSales();
-}
-
-function setChartPeriod(chart, period, btn) {
-  periods[chart] = period;
-  btn.closest('.local-filters').querySelectorAll('.local-filter-btn').forEach(b => b.classList.remove('active'));
-  btn.classList.add('active');
-  if (chart === 'ca') loadCA();
-  if (chart === 'sales' || chart === 'salesTable') loadSales();
-  if (chart === 'retardTable') loadRetard();
+function compareEnabled() {
+  return document.getElementById('compareGlobal').checked;
 }
 
 async function loadCA() {
   try {
-    const compare = document.getElementById('compareCA').checked;
-    const [chartData, kpiData] = await Promise.all([
-      fetchJson(`/api/ca?period=${periods.ca}`),
-      fetchJson(`/api/ca?period=${localKpi.ca}`),
-    ]);
-    document.getElementById('kpiCA').textContent = fmt(kpiData.total);
-    document.getElementById('kpiCASub').textContent = `${kpiData.labels.length} poste(s) — ${kpiData.period_label}`;
-    document.getElementById('kpiCAPct').innerHTML = pctBadge(kpiData.pct);
-    document.getElementById('caChartSub').textContent = `Top 5 clients + autres — ${chartData.period_label}`;
+    const query = buildQuery();
+    const data = await fetchJson(`/api/ca?${query}`);
+
+    document.getElementById('kpiCA').textContent = fmt(data.total);
+    document.getElementById('kpiCASub').textContent = `${data.labels.length} poste(s) — ${data.period_label}`;
+    document.getElementById('kpiCAPct').innerHTML = compareEnabled() ? pctBadge(data.pct) : '';
+    document.getElementById('caChartSub').textContent = `Top 5 clients + autres — ${data.period_label}`;
+
     if (chartCA) chartCA.destroy();
-    const datasets = [{ label: 'Période actuelle', data: chartData.values, backgroundColor: 'rgba(79,142,247,0.7)', borderColor: 'rgba(79,142,247,1)', borderWidth: 1, borderRadius: 4 }];
-    if (compare) datasets.push({ label: 'Année précédente', data: chartData.prev_values, backgroundColor: 'rgba(79,142,247,0.2)', borderColor: 'rgba(79,142,247,0.5)', borderWidth: 1, borderRadius: 4 });
+
+    const datasets = [{
+      label: 'Période actuelle',
+      data: data.values,
+      backgroundColor: 'rgba(79,142,247,0.7)',
+      borderColor: 'rgba(79,142,247,1)',
+      borderWidth: 1,
+      borderRadius: 4
+    }];
+
+    if (compareEnabled()) {
+      datasets.push({
+        label: 'Année précédente',
+        data: data.prev_values,
+        backgroundColor: 'rgba(79,142,247,0.2)',
+        borderColor: 'rgba(79,142,247,0.5)',
+        borderWidth: 1,
+        borderRadius: 4
+      });
+    }
+
     chartCA = new Chart(document.getElementById('chartCA'), {
-      type: 'bar', data: { labels: chartData.labels, datasets },
-      options: { responsive: true, plugins: { legend: { display: compare, labels: { color: '#8890a8', font: { size: 11 } } } }, scales: { x: { ticks: { color: '#8890a8', font: { size: 10 } }, grid: { color: '#2a2f45' } }, y: { ticks: { color: '#8890a8', font: { size: 10 }, callback: v => fmt(v) }, grid: { color: '#2a2f45' } } } }
+      type: 'bar',
+      data: { labels: data.labels, datasets },
+      options: {
+        responsive: true,
+        plugins: {
+          legend: {
+            display: compareEnabled(),
+            labels: { color: '#8890a8', font: { size: 11 } }
+          }
+        },
+        scales: {
+          x: { ticks: { color: '#8890a8', font: { size: 10 } }, grid: { color: '#2a2f45' } },
+          y: { ticks: { color: '#8890a8', font: { size: 10 }, callback: v => fmt(v) }, grid: { color: '#2a2f45' } }
+        }
+      }
     });
   } catch (error) {
     showError('chartCA', error);
@@ -749,41 +749,77 @@ async function loadCA() {
 
 async function loadSales() {
   try {
-    const compare = document.getElementById('compareSales').checked;
-    const [chartData, kpiData, tableData] = await Promise.all([
-      fetchJson(`/api/sales?period=${periods.sales}`),
-      fetchJson(`/api/sales?period=${localKpi.sales}`),
-      fetchJson(`/api/sales?period=${periods.salesTable}`),
-    ]);
-    document.getElementById('kpiQuotes').textContent = fmt(kpiData.quote_total);
-    document.getElementById('kpiQuotesSub').textContent = `${kpiData.quote_count} devis — ${kpiData.period_label}`;
-    document.getElementById('kpiQuotesPct').innerHTML = pctBadge(kpiData.quote_pct);
-    document.getElementById('kpiOrders').textContent = fmt(kpiData.order_total);
-    document.getElementById('kpiOrdersSub').textContent = `${kpiData.order_count} commande(s) — ${kpiData.period_label}`;
-    document.getElementById('kpiOrdersPct').innerHTML = pctBadge(kpiData.order_pct);
-    document.getElementById('salesChartSub').textContent = `Montants HTVA — ${chartData.period_label}`;
-    document.getElementById('salesTableSub').textContent = `Devis en cours et bons à facturer — ${tableData.period_label}`;
+    const query = buildQuery();
+    const data = await fetchJson(`/api/sales?${query}`);
+
+    document.getElementById('kpiQuotes').textContent = fmt(data.quote_total);
+    document.getElementById('kpiQuotesSub').textContent = `${data.quote_count} devis — ${data.period_label}`;
+    document.getElementById('kpiQuotesPct').innerHTML = compareEnabled() ? pctBadge(data.quote_pct) : '';
+
+    document.getElementById('kpiOrders').textContent = fmt(data.order_total);
+    document.getElementById('kpiOrdersSub').textContent = `${data.order_count} commande(s) — ${data.period_label}`;
+    document.getElementById('kpiOrdersPct').innerHTML = compareEnabled() ? pctBadge(data.order_pct) : '';
+
+    document.getElementById('salesChartSub').textContent = `Montants HTVA — ${data.period_label}`;
+    document.getElementById('salesTableSub').textContent = `Devis en cours et bons à facturer — ${data.period_label}`;
 
     if (chartSales) chartSales.destroy();
-    const datasets = [{ label: 'Période actuelle', data: chartData.values, backgroundColor: ['rgba(79,142,247,0.75)','rgba(79,247,160,0.75)'], borderRadius: 6 }];
-    if (compare) datasets.push({ label: 'Année précédente', data: chartData.prev_values, backgroundColor: ['rgba(79,142,247,0.25)','rgba(79,247,160,0.25)'], borderRadius: 6 });
+
+    const datasets = [{
+      label: 'Période actuelle',
+      data: data.values,
+      backgroundColor: ['rgba(79,142,247,0.75)','rgba(79,247,160,0.75)'],
+      borderRadius: 6
+    }];
+
+    if (compareEnabled()) {
+      datasets.push({
+        label: 'Année précédente',
+        data: data.prev_values,
+        backgroundColor: ['rgba(79,142,247,0.25)','rgba(79,247,160,0.25)'],
+        borderRadius: 6
+      });
+    }
+
     chartSales = new Chart(document.getElementById('chartSales'), {
       type: 'bar',
-      data: { labels: chartData.labels, datasets },
-      options: { responsive: true, plugins: { legend: { display: compare, labels: { color: '#8890a8', font: { size: 11 } } } }, scales: { x: { ticks: { color: '#8890a8', font: { size: 10 } }, grid: { color: '#2a2f45' } }, y: { ticks: { color: '#8890a8', font: { size: 10 }, callback: v => fmt(v) }, grid: { color: '#2a2f45' } } } }
+      data: { labels: data.labels, datasets },
+      options: {
+        responsive: true,
+        plugins: {
+          legend: {
+            display: compareEnabled(),
+            labels: { color: '#8890a8', font: { size: 11 } }
+          }
+        },
+        scales: {
+          x: { ticks: { color: '#8890a8', font: { size: 10 } }, grid: { color: '#2a2f45' } },
+          y: { ticks: { color: '#8890a8', font: { size: 10 }, callback: v => fmt(v) }, grid: { color: '#2a2f45' } }
+        }
+      }
     });
 
     const renderSection = (title, rows, statusClass) => {
-      if (!rows.length) return `<div><div class="mini-table-title">${title}</div><div class="empty-state">${title === 'Devis en cours' ? 'Aucun devis en cours sur la période' : 'Aucun bon à facturer sur la période'}</div></div>`;
+      if (!rows.length) {
+        return `<div><div class="mini-table-title">${title}</div><div class="empty-state">${title === 'Devis en cours' ? 'Aucun devis en cours sur la période' : 'Aucun bon à facturer sur la période'}</div></div>`;
+      }
       let html = `<div><div class="mini-table-title">${title}</div><table><thead><tr><th>Numéro</th><th>Client</th><th>Montant</th><th>Date</th><th>Statut</th><th></th></tr></thead><tbody>`;
       for (const r of rows) {
-        html += `<tr><td><span style="font-family:monospace;font-size:12px;color:#8890a8">${r.numero}</span></td><td>${r.client}</td><td><span class="montant">${fmt(r.montant)}</span></td><td><span style="font-family:monospace;font-size:12px">${r.date || '—'}</span></td><td><span class="status-badge ${statusClass}">${r.invoice_status_label}</span></td><td><a class="action-link" href="${r.url}" target="_blank" rel="noopener noreferrer">Voir</a></td></tr>`;
+        html += `<tr>
+          <td><span style="font-family:monospace;font-size:12px;color:#8890a8">${r.numero}</span></td>
+          <td>${r.client}</td>
+          <td><span class="montant">${fmt(r.montant)}</span></td>
+          <td><span style="font-family:monospace;font-size:12px">${r.date || '—'}</span></td>
+          <td><span class="status-badge ${statusClass}">${r.invoice_status_label}</span></td>
+          <td>${r.url ? `<a class="table-link" href="${r.url}" target="_blank">Voir</a>` : ''}</td>
+        </tr>`;
       }
       html += '</tbody></table></div>';
       return html;
     };
 
-    document.getElementById('tableSales').innerHTML = `<div class="split-list">${renderSection('Devis en cours', tableData.quotes, '')}${renderSection('Bons à facturer', tableData.orders, 'success-badge')}</div>`;
+    document.getElementById('tableSales').innerHTML =
+      `<div class="split-list">${renderSection('Devis en cours', data.quotes, '')}${renderSection('Bons à facturer', data.orders, 'success-badge')}</div>`;
   } catch (error) {
     showError('chartSales', error);
     showError('tableSales', error);
@@ -794,22 +830,32 @@ async function loadSales() {
 
 async function loadRetard() {
   try {
-    const [tableData, kpiData] = await Promise.all([
-      fetchJson(`/api/retard?period=${periods.retardTable}`),
-      fetchJson(`/api/retard?period=${localKpi.retard}`),
-    ]);
-    document.getElementById('kpiRetard').textContent = fmt(kpiData.total);
-    document.getElementById('kpiRetardSub').textContent = `${kpiData.count} facture(s) — ${kpiData.period_label}`;
-    document.getElementById('kpiRetardPct').innerHTML = pctBadge(kpiData.pct);
-    document.getElementById('retardTableSub').textContent = `Factures en retard — ${tableData.period_label}`;
-    if (tableData.factures.length === 0) {
+    const query = buildQuery();
+    const data = await fetchJson(`/api/retard?${query}`);
+
+    document.getElementById('kpiRetard').textContent = fmt(data.total);
+    document.getElementById('kpiRetardSub').textContent = `${data.count} facture(s) — ${data.period_label}`;
+    document.getElementById('kpiRetardPct').innerHTML = compareEnabled() ? pctBadge(data.pct) : '';
+    document.getElementById('retardTableSub').textContent = `Factures en retard — ${data.period_label}`;
+
+    if (data.factures.length === 0) {
       document.getElementById('tableRetard').innerHTML = '<div class="empty-state">✅ Aucune facture en retard</div>';
       return;
     }
+
     let html = `<table><thead><tr><th>Numéro</th><th>Client</th><th>Montant dû</th><th>Échéance</th><th>Retard</th><th>Priorité</th><th></th></tr></thead><tbody>`;
-    for (const f of tableData.factures) {
-      const badgeClass = f.priority_class === 'retard-high' ? 'danger-badge' : f.priority_class === 'retard-mid' ? 'warning-badge' : 'status-badge';
-      html += `<tr><td><span style="font-family:monospace;font-size:12px;color:#8890a8">${f.numero}</span></td><td>${f.client}</td><td><span class="montant">${fmt(f.montant)}</span></td><td><span style="font-family:monospace;font-size:12px">${f.echeance}</span></td><td><span class="retard-badge ${f.priority_class}">+${f.retard_jours}j</span></td><td><span class="status-badge ${badgeClass}">${f.priority_label}</span></td><td><a class="action-link" href="${f.url}" target="_blank" rel="noopener noreferrer">Voir</a></td></tr>`;
+    for (const f of data.factures) {
+      const cls = f.retard_jours > 60 ? 'retard-high' : f.retard_jours > 30 ? 'retard-mid' : 'retard-low';
+      const badgeCls = f.priority === 'Critique' ? 'danger-badge' : f.priority === 'Haute' ? 'warning-badge' : '';
+      html += `<tr>
+        <td><span style="font-family:monospace;font-size:12px;color:#8890a8">${f.numero}</span></td>
+        <td>${f.client}</td>
+        <td><span class="montant">${fmt(f.montant)}</span></td>
+        <td><span style="font-family:monospace;font-size:12px">${f.echeance}</span></td>
+        <td><span class="retard-badge ${cls}">+${f.retard_jours}j</span></td>
+        <td><span class="status-badge ${badgeCls}">${f.priority}</span></td>
+        <td>${f.url ? `<a class="table-link" href="${f.url}" target="_blank">Voir</a>` : ''}</td>
+      </tr>`;
     }
     html += '</tbody></table>';
     document.getElementById('tableRetard').innerHTML = html;
@@ -829,23 +875,27 @@ async function loadAll() {
 }
 
 window.addEventListener('DOMContentLoaded', () => {
-  document.querySelectorAll('.local-filter-btn').forEach(btn => {
-    const onclick = btn.getAttribute('onclick') || '';
-    if (onclick.includes("'ca'")) btn.dataset.scope = 'ca-chart';
-    if (onclick.includes("'sales'")) btn.dataset.scope = 'sales-chart';
-    if (onclick.includes("'retardTable'")) btn.dataset.scope = 'retard-table';
-    if (onclick.includes("'salesTable'")) btn.dataset.scope = 'sales-table';
-    const match = onclick.match(/'([^']+)'\)/g);
-    if (match && match.length >= 1) {
-      btn.dataset.period = match[0].replace(/[\'\)]/g, '');
-    }
-  });
+  const today = new Date();
+  const currentYear = today.getFullYear();
+  const currentMonth = String(today.getMonth() + 1).padStart(2, '0');
+  const currentDay = String(today.getDate()).padStart(2, '0');
+  document.getElementById('dateTo').value = `${currentYear}-${currentMonth}-${currentDay}`;
+  document.getElementById('dateFrom').value = `${currentYear}-${currentMonth}-01`;
+  state.dateFrom = document.getElementById('dateFrom').value;
+  state.dateTo = document.getElementById('dateTo').value;
   loadAll();
 });
 </script>
 </body>
 </html>
 """
+
+
+def get_request_period_args():
+    period = request.args.get("period", "month")
+    date_from = request.args.get("date_from")
+    date_to = request.args.get("date_to")
+    return period, date_from, date_to
 
 
 @app.route("/")
@@ -862,17 +912,20 @@ def api_health():
 
 @app.route("/api/ca")
 def api_ca():
-    return jsonify(get_ca(request.args.get("period", "month")))
+    period, date_from, date_to = get_request_period_args()
+    return jsonify(get_ca(period, date_from, date_to))
 
 
 @app.route("/api/retard")
 def api_retard():
-    return jsonify(get_factures_retard(request.args.get("period", "month")))
+    period, date_from, date_to = get_request_period_args()
+    return jsonify(get_factures_retard(period, date_from, date_to))
 
 
 @app.route("/api/sales")
 def api_sales():
-    return jsonify(get_sales_pipeline(request.args.get("period", "month")))
+    period, date_from, date_to = get_request_period_args()
+    return jsonify(get_sales_pipeline(period, date_from, date_to))
 
 
 @app.errorhandler(Exception)
