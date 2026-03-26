@@ -1,1004 +1,804 @@
-
 from flask import Flask, render_template_string, jsonify, request
-import os
-import ssl
-import time
-import xmlrpc.client
+import os, ssl, time, xmlrpc.client
 from datetime import date, datetime, timedelta
 from dateutil.relativedelta import relativedelta
 
 app = Flask(__name__)
 
-ODOO_URL = os.environ.get("ODOO_URL", "").rstrip("/")
-ODOO_DB = os.environ.get("ODOO_DB", "")
+ODOO_URL      = os.environ.get("ODOO_URL", "").rstrip("/")
+ODOO_DB       = os.environ.get("ODOO_DB", "")
 ODOO_USERNAME = os.environ.get("ODOO_USERNAME", "")
-ODOO_API_KEY = os.environ.get("ODOO_API_KEY", "")
-CACHE_TTL = int(os.environ.get("CACHE_TTL", "120"))
-ODOO_PAGE_SIZE = int(os.environ.get("ODOO_PAGE_SIZE", "200"))
-ALLOW_INSECURE_SSL = os.environ.get("ODOO_INSECURE_SSL", "0") == "1"
+ODOO_API_KEY  = os.environ.get("ODOO_API_KEY", "")
+CACHE_TTL     = int(os.environ.get("CACHE_TTL", "120"))
+PAGE_SIZE     = int(os.environ.get("ODOO_PAGE_SIZE", "200"))
 
 _cache = {}
 
-
-def _validate_env():
-    missing = [
-        key for key, value in {
-            "ODOO_URL": ODOO_URL,
-            "ODOO_DB": ODOO_DB,
-            "ODOO_USERNAME": ODOO_USERNAME,
-            "ODOO_API_KEY": ODOO_API_KEY,
-        }.items() if not value
-    ]
-    if missing:
-        raise RuntimeError(f"Variables d'environnement manquantes : {', '.join(missing)}")
-
-
-_validate_env()
-
-
-def cached(ttl_seconds=CACHE_TTL):
-    def decorator(func):
-        def wrapper(*args):
-            key = (func.__name__, args)
+def cached(ttl=CACHE_TTL):
+    def dec(fn):
+        def wrap(*a):
+            k = (fn.__name__, a)
             now = time.time()
-            item = _cache.get(key)
-            if item and now - item["ts"] < ttl_seconds:
-                return item["value"]
-            value = func(*args)
-            _cache[key] = {"ts": now, "value": value}
-            return value
-        wrapper.__name__ = func.__name__
-        return wrapper
-    return decorator
+            it = _cache.get(k)
+            if it and now - it["ts"] < ttl:
+                return it["value"]
+            v = fn(*a)
+            _cache[k] = {"ts": now, "value": v}
+            return v
+        wrap.__name__ = fn.__name__
+        return wrap
+    return dec
 
+class OdooError(Exception): pass
 
-class OdooDashboardError(Exception):
-    pass
+def get_conn():
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    common = xmlrpc.client.ServerProxy(f"{ODOO_URL}/xmlrpc/2/common", context=ctx, allow_none=True)
+    uid = common.authenticate(ODOO_DB, ODOO_USERNAME, ODOO_API_KEY, {})
+    if not uid:
+        raise OdooError("Authentification refusée")
+    models = xmlrpc.client.ServerProxy(f"{ODOO_URL}/xmlrpc/2/object", context=ctx, allow_none=True)
+    return models, uid
 
-
-def get_connection():
+def xkw(model, method, args=None, kwargs=None):
+    m, uid = get_conn()
     try:
-        ssl_context = None
-        if ALLOW_INSECURE_SSL:
-            ssl_context = ssl.create_default_context()
-            ssl_context.check_hostname = False
-            ssl_context.verify_mode = ssl.CERT_NONE
+        return m.execute_kw(ODOO_DB, uid, ODOO_API_KEY, model, method, args or [], kwargs or {})
+    except xmlrpc.client.Fault as e:
+        raise OdooError(str(e))
 
-        common = xmlrpc.client.ServerProxy(
-            f"{ODOO_URL}/xmlrpc/2/common",
-            context=ssl_context,
-            allow_none=True,
-        )
-        uid = common.authenticate(ODOO_DB, ODOO_USERNAME, ODOO_API_KEY, {})
-        if not uid:
-            raise OdooDashboardError(
-                "Authentification Odoo refusée. Vérifie ODOO_DB, ODOO_USERNAME et ODOO_API_KEY."
-            )
-        models = xmlrpc.client.ServerProxy(
-            f"{ODOO_URL}/xmlrpc/2/object",
-            context=ssl_context,
-            allow_none=True,
-        )
-        return models, uid
-    except OdooDashboardError:
-        raise
-    except Exception as exc:
-        raise OdooDashboardError(f"Connexion Odoo impossible : {exc}") from exc
+def search_all(model, domain, fields, order=None):
+    out, offset = [], 0
+    while True:
+        kw = {"fields": fields, "limit": PAGE_SIZE, "offset": offset}
+        if order: kw["order"] = order
+        batch = xkw(model, "search_read", [domain], kw)
+        out.extend(batch)
+        if len(batch) < PAGE_SIZE: break
+        offset += PAGE_SIZE
+    return out
 
+def pct(cur, prev):
+    if not prev: return None
+    return round((cur - prev) / prev * 100, 1)
 
-def execute_kw(model, method, args=None, kwargs=None):
-    args = args or []
-    kwargs = kwargs or {}
-    models, uid = get_connection()
-    try:
-        return models.execute_kw(ODOO_DB, uid, ODOO_API_KEY, model, method, args, kwargs)
-    except xmlrpc.client.Fault as exc:
-        raise OdooDashboardError(f"Erreur Odoo ({model}.{method}) : {exc}") from exc
-    except Exception as exc:
-        raise OdooDashboardError(f"Erreur réseau Odoo ({model}.{method}) : {exc}") from exc
-
-
-VALID_PERIODS = {"today", "week", "month", "quarter", "year", "custom"}
-
-
-def get_odoo_record_url(model, record_id):
-    return f"{ODOO_URL}/web#id={record_id}&model={model}&view_type=form"
-
-
-def parse_iso_date(value):
-    if not value:
-        return None
-    try:
-        return datetime.strptime(value, "%Y-%m-%d").date()
-    except ValueError as exc:
-        raise OdooDashboardError(f"Date invalide : {value}. Format attendu : YYYY-MM-DD.") from exc
-
-
-def get_period_dates(period, custom_start=None, custom_end=None):
-    period = period if period in VALID_PERIODS else "month"
+def period_dates(period):
     today = date.today()
-
-    if period == "today":
-        return today, today
-    if period == "week":
-        start = today - timedelta(days=today.weekday())
-        return start, today
     if period == "month":
         return today.replace(day=1), today
-    if period == "quarter":
-        q = (today.month - 1) // 3
-        start = date(today.year, q * 3 + 1, 1)
-        return start, today
-    if period == "year":
-        return today.replace(month=1, day=1), today
+    return today.replace(month=1, day=1), today
 
-    start = parse_iso_date(custom_start)
-    end = parse_iso_date(custom_end)
-    if not start or not end:
-        raise OdooDashboardError("Pour une période personnalisée, la date de début et la date de fin sont requises.")
-    if end < start:
-        raise OdooDashboardError("La date de fin doit être postérieure ou égale à la date de début.")
-    return start, end
-
-
-def get_prev_period_dates(period, start, end):
-    return start - relativedelta(years=1), end - relativedelta(years=1)
-
-
-def pct_change(current, previous):
-    if previous == 0:
-        return None
-    return round((current - previous) / previous * 100, 1)
-
-
-STATUS_LABELS = {
-    "draft": "Devis",
-    "sent": "Devis envoyé",
-    "sale": "Commande",
-    "done": "Terminé",
-    "cancel": "Annulé",
-    "upselling": "Upsell",
-    "no": "Rien à facturer",
-    "to invoice": "À facturer",
-    "invoiced": "Entièrement facturé",
-}
-
-
-def label_for_status(value):
-    return STATUS_LABELS.get(value, value or "—")
-
-
-def summarize_top_items(mapping, limit=5):
-    items = sorted(mapping.items(), key=lambda x: x[1], reverse=True)
-    top = items[:limit]
-    others_total = round(sum(v for _, v in items[limit:]), 2)
-    if others_total > 0:
-        top.append(("Autres", others_total))
-    return top
-
-
-def build_partner_domain(partner_id):
-    if not partner_id:
-        return []
-    try:
-        pid = int(partner_id)
-    except (TypeError, ValueError) as exc:
-        raise OdooDashboardError("partner_id invalide.") from exc
-    # On évite commercial_partner_id ici car le champ n'existe pas sur tous les modèles
-    # (ex: sale.order). Le domain child_of sur partner_id est plus robuste pour couvrir
-    # la société sélectionnée et ses contacts éventuels.
-    return [["partner_id", "child_of", pid]]
-
-
-def search_read_all(model, domain, fields, order=None, limit=ODOO_PAGE_SIZE):
-    records = []
-    offset = 0
-    while True:
-        batch = execute_kw(
-            model,
-            "search_read",
-            [domain],
-            {
-                "fields": fields,
-                "limit": limit,
-                "offset": offset,
-                **({"order": order} if order else {}),
-            },
-        )
-        records.extend(batch)
-        if len(batch) < limit:
-            break
-        offset += limit
-    return records
-
+def odoo_url(model, rid):
+    return f"{ODOO_URL}/web#id={rid}&model={model}&view_type=form"
 
 @cached()
 def get_clients():
-    records = search_read_all(
-        "res.partner",
-        [
-            ["is_company", "=", True],
-            ["customer_rank", ">", 0],
-            ["active", "=", True],
-        ],
-        ["name"],
-        order="name asc",
-    )
-    seen = set()
-    clients = []
-    for rec in records:
-        rid = rec.get("id")
-        name = (rec.get("name") or "").strip()
-        if not rid or not name:
-            continue
-        if rid in seen:
-            continue
-        seen.add(rid)
-        clients.append({"id": rid, "name": name})
-    return clients
+    rows = search_all("res.partner",
+        [["is_company","=",True],["customer_rank",">",0],["active","=",True]],
+        ["name"], order="name asc")
+    seen, out = set(), []
+    for r in rows:
+        if r["id"] not in seen:
+            seen.add(r["id"])
+            out.append({"id": r["id"], "name": (r.get("name") or "").strip()})
+    return out
 
+def partner_domain(pid):
+    if not pid: return []
+    return [["partner_id","child_of",int(pid)]]
 
 @cached()
-def fetch_ca(date_debut, date_fin, partner_id):
+def fetch_invoices(d_start, d_end, pid):
     domain = [
-        ["move_type", "=", "out_invoice"],
-        ["state", "=", "posted"],
-        ["invoice_date", ">=", str(date_debut)],
-        ["invoice_date", "<=", str(date_fin)],
-    ] + build_partner_domain(partner_id)
+        ["move_type","=","out_invoice"],
+        ["state","=","posted"],
+        ["invoice_date",">=",str(d_start)],
+        ["invoice_date","<=",str(d_end)],
+    ] + partner_domain(pid)
+    return search_all("account.move", domain,
+        ["id","name","partner_id","amount_untaxed","amount_total",
+         "amount_residual","payment_state","invoice_date","invoice_date_due"],
+        order="invoice_date desc")
 
-    invoices = search_read_all(
-        "account.move",
-        domain,
-        ["partner_id", "amount_untaxed"],
-        order="amount_untaxed desc",
-    )
-    ca = {}
-    for inv in invoices:
+def classify(inv, today):
+    ps  = inv.get("payment_state","")
+    due = inv.get("invoice_date_due")
+    if ps in ("paid","in_payment"): return "paid"
+    if due and datetime.strptime(due,"%Y-%m-%d").date() < today: return "overdue"
+    return "pending"
+
+@cached()
+def get_invoice_data(period, pid):
+    start, end = period_dates(period)
+    ps, pe     = start - relativedelta(years=1), end - relativedelta(years=1)
+    today      = date.today()
+
+    cur  = fetch_invoices(start, end, pid)
+    prev = fetch_invoices(ps, pe, pid)
+
+    def stats(rows):
+        paid=pending=overdue=0
+        paid_n=pending_n=overdue_n=0
+        ca=0
+        detail={"paid":[],"pending":[],"overdue":[]}
+        for inv in rows:
+            amt  = inv.get("amount_total") or 0
+            res  = inv.get("amount_residual") or 0
+            htva = inv.get("amount_untaxed") or 0
+            ca  += htva
+            cls  = classify(inv, today)
+            due  = inv.get("invoice_date_due","")
+            retard = None
+            if due and cls=="overdue":
+                retard = (today - datetime.strptime(due,"%Y-%m-%d").date()).days
+            row = {
+                "id":      inv.get("id"),
+                "numero":  inv.get("name","—"),
+                "client":  inv["partner_id"][1] if inv.get("partner_id") else "Inconnu",
+                "htva":    round(htva,2),
+                "ttc":     round(amt,2),
+                "restant": round(res,2),
+                "echeance":due,
+                "date":    inv.get("invoice_date",""),
+                "retard":  retard,
+                "url":     odoo_url("account.move", inv.get("id")),
+            }
+            detail[cls].append(row)
+            if cls=="paid":    paid+=amt; paid_n+=1
+            elif cls=="pending": pending+=res; pending_n+=1
+            else:              overdue+=res; overdue_n+=1
+        return {
+            "ca":round(ca,2), "paid":round(paid,2), "pending":round(pending,2), "overdue":round(overdue,2),
+            "paid_n":paid_n, "pending_n":pending_n, "overdue_n":overdue_n,
+            "total_n":len(rows), "detail":detail,
+        }
+
+    c = stats(cur)
+    p = stats(prev)
+    c["ca_pct"]      = pct(c["ca"], p["ca"])
+    c["paid_pct"]    = pct(c["paid"], p["paid"])
+    c["pending_pct"] = pct(c["pending"], p["pending"])
+    c["overdue_pct"] = pct(c["overdue"], p["overdue"])
+    c["period"]      = f"{start} → {end}"
+    c["prev_period"] = f"{ps} → {pe}"
+
+    # Top clients CA
+    by_client={}
+    for inv in cur:
         nom = inv["partner_id"][1] if inv.get("partner_id") else "Inconnu"
-        ca[nom] = ca.get(nom, 0) + (inv.get("amount_untaxed") or 0)
-    return ca
+        by_client[nom] = by_client.get(nom,0) + (inv.get("amount_untaxed") or 0)
+    top = sorted(by_client.items(), key=lambda x:x[1], reverse=True)[:8]
+    c["top_labels"] = [x[0] for x in top]
+    c["top_values"] = [round(x[1],2) for x in top]
 
+    # Évolution mensuelle 12 mois
+    monthly={}
+    base = date.today().replace(day=1)
+    for i in range(11,-1,-1):
+        m = base - relativedelta(months=i)
+        monthly[m.strftime("%b %Y")] = 0
+    for inv in fetch_invoices(base-relativedelta(months=11), end, pid):
+        d = inv.get("invoice_date","")
+        if not d: continue
+        key = datetime.strptime(d,"%Y-%m-%d").date().replace(day=1).strftime("%b %Y")
+        if key in monthly:
+            monthly[key] = monthly.get(key,0) + (inv.get("amount_untaxed") or 0)
+    c["monthly_labels"] = list(monthly.keys())
+    c["monthly_values"] = [round(v,2) for v in monthly.values()]
 
-@cached()
-def get_ca(period, custom_start, custom_end, partner_id):
-    start, end = get_period_dates(period, custom_start, custom_end)
-    prev_start, prev_end = get_prev_period_dates(period, start, end)
-    current = fetch_ca(start, end, partner_id)
-    previous = fetch_ca(prev_start, prev_end, partner_id)
-    total_current = round(sum(current.values()), 2)
-    total_previous = round(sum(previous.values()), 2)
-    trie = summarize_top_items(current, limit=5)
-    prev_trie = summarize_top_items(previous, limit=5)
-    return {
-        "labels": [x[0] for x in trie],
-        "values": [round(x[1], 2) for x in trie],
-        "prev_labels": [x[0] for x in prev_trie],
-        "prev_values": [round(x[1], 2) for x in prev_trie],
-        "total": total_current,
-        "total_prev": total_previous,
-        "pct": pct_change(total_current, total_previous),
-        "period_label": f"{start} → {end}",
-        "prev_period_label": f"{prev_start} → {prev_end}",
-    }
+    return c
 
-
-@cached()
-def get_factures_retard(period, custom_start, custom_end, partner_id):
-    start, end = get_period_dates(period, custom_start, custom_end)
-    prev_start, prev_end = get_prev_period_dates(period, start, end)
-    today = date.today()
-
-    def fetch(d_start, d_end):
-        domain = [
-            ["move_type", "=", "out_invoice"],
-            ["state", "=", "posted"],
-            ["payment_state", "in", ["not_paid", "partial"]],
-            ["invoice_date_due", "!=", False],
-            ["invoice_date_due", "<", str(today)],
-            ["invoice_date", ">=", str(d_start)],
-            ["invoice_date", "<=", str(d_end)],
-        ] + build_partner_domain(partner_id)
-        return search_read_all(
-            "account.move",
-            domain,
-            ["id", "name", "partner_id", "amount_residual", "invoice_date_due"],
-            order="invoice_date_due asc",
-        )
-
-    def process(invoices):
-        result = []
-        for inv in invoices:
-            due_raw = inv.get("invoice_date_due")
-            if not due_raw:
-                continue
-            due = datetime.strptime(due_raw, "%Y-%m-%d").date()
-            retard = (today - due).days
-            priority = "Normale"
-            priority_class = "retard-low"
-            if retard > 60:
-                priority = "Critique"
-                priority_class = "retard-high"
-            elif retard > 30:
-                priority = "Haute"
-                priority_class = "retard-mid"
-
-            result.append({
-                "id": inv.get("id"),
-                "numero": inv.get("name") or "—",
-                "client": inv["partner_id"][1] if inv.get("partner_id") else "Inconnu",
-                "montant": round(inv.get("amount_residual") or 0, 2),
-                "echeance": due_raw,
-                "retard_jours": retard,
-                "priority": priority,
-                "priority_class": priority_class,
-                "url": get_odoo_record_url("account.move", inv.get("id")),
-            })
-        result.sort(key=lambda x: x["retard_jours"], reverse=True)
-        return result
-
-    current_list = process(fetch(start, end))
-    previous_list = process(fetch(prev_start, prev_end))
-    total_current = round(sum(x["montant"] for x in current_list), 2)
-    total_previous = round(sum(x["montant"] for x in previous_list), 2)
-    return {
-        "factures": current_list,
-        "total": total_current,
-        "count": len(current_list),
-        "total_prev": total_previous,
-        "count_prev": len(previous_list),
-        "pct": pct_change(total_current, total_previous),
-        "period_label": f"{start} → {end}",
-        "prev_period_label": f"{prev_start} → {prev_end}",
-    }
-
-
-@cached()
-def fetch_sales_pipeline(date_debut, date_fin, partner_id):
-    fields = [
-        "id",
-        "name",
-        "partner_id",
-        "amount_untaxed",
-        "date_order",
-        "state",
-        "invoice_status",
-    ]
-    partner_domain = build_partner_domain(partner_id)
-
-    quotes = search_read_all(
-        "sale.order",
-        [
-            ["state", "in", ["draft", "sent"]],
-            ["invoice_status", "=", "no"],
-            ["date_order", ">=", f"{date_debut} 00:00:00"],
-            ["date_order", "<=", f"{date_fin} 23:59:59"],
-        ] + partner_domain,
-        fields,
-        order="date_order desc",
-    )
-
-    orders_to_invoice = search_read_all(
-        "sale.order",
-        [
-            ["state", "in", ["sale", "done"]],
-            ["invoice_status", "=", "to invoice"],
-            ["date_order", ">=", f"{date_debut} 00:00:00"],
-            ["date_order", "<=", f"{date_fin} 23:59:59"],
-        ] + partner_domain,
-        fields,
-        order="date_order desc",
-    )
-
-    def map_rows(records, kind):
-        rows = []
-        for rec in records:
-            rows.append({
-                "id": rec.get("id"),
-                "type": kind,
-                "numero": rec.get("name") or "—",
-                "client": rec["partner_id"][1] if rec.get("partner_id") else "Inconnu",
-                "montant": round(rec.get("amount_untaxed") or 0, 2),
-                "date": (rec.get("date_order") or "")[:10],
-                "state": rec.get("state") or "",
-                "state_label": label_for_status(rec.get("state")),
-                "invoice_status": rec.get("invoice_status") or "",
-                "invoice_status_label": label_for_status(rec.get("invoice_status")),
-                "url": get_odoo_record_url("sale.order", rec.get("id")),
-            })
-        return rows
-
-    quotes_rows = map_rows(quotes, "devis")
-    orders_rows = map_rows(orders_to_invoice, "commande")
-
-    return {
-        "quotes": quotes_rows,
-        "orders": orders_rows,
-        "quote_total": round(sum(x["montant"] for x in quotes_rows), 2),
-        "order_total": round(sum(x["montant"] for x in orders_rows), 2),
-        "quote_count": len(quotes_rows),
-        "order_count": len(orders_rows),
-    }
-
-
-@cached()
-def get_sales_pipeline(period, custom_start, custom_end, partner_id):
-    start, end = get_period_dates(period, custom_start, custom_end)
-    prev_start, prev_end = get_prev_period_dates(period, start, end)
-
-    current = fetch_sales_pipeline(start, end, partner_id)
-    previous = fetch_sales_pipeline(prev_start, prev_end, partner_id)
-
-    total_current = round(current["quote_total"] + current["order_total"], 2)
-    total_previous = round(previous["quote_total"] + previous["order_total"], 2)
-
-    return {
-        "labels": ["Devis en cours", "Bons à facturer"],
-        "values": [current["quote_total"], current["order_total"]],
-        "prev_labels": ["Devis en cours", "Bons à facturer"],
-        "prev_values": [previous["quote_total"], previous["order_total"]],
-        "total": total_current,
-        "total_prev": total_previous,
-        "pct": pct_change(total_current, total_previous),
-        "quote_total": current["quote_total"],
-        "order_total": current["order_total"],
-        "quote_count": current["quote_count"],
-        "order_count": current["order_count"],
-        "quote_total_prev": previous["quote_total"],
-        "order_total_prev": previous["order_total"],
-        "quote_count_prev": previous["quote_count"],
-        "order_count_prev": previous["order_count"],
-        "quote_pct": pct_change(current["quote_total"], previous["quote_total"]),
-        "order_pct": pct_change(current["order_total"], previous["order_total"]),
-        "quotes": current["quotes"],
-        "orders": current["orders"],
-        "period_label": f"{start} → {end}",
-        "prev_period_label": f"{prev_start} → {prev_end}",
-    }
-
-
-HTML = """
-<!DOCTYPE html>
+HTML = r"""<!DOCTYPE html>
 <html lang="fr">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Odoo Dashboard</title>
-<link href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=DM+Sans:wght@300;400;500;600&display=swap" rel="stylesheet">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ConiMind · Dashboard Facturation</title>
+<link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.0/chart.umd.min.js"></script>
 <style>
-  :root {
-    --bg: #0f1117; --surface: #181c27; --surface2: #1e2333; --border: #2a2f45;
-    --accent: #4f8ef7; --accent2: #f7634f; --accent3: #4ff7a0;
-    --text: #e8eaf0; --text2: #8890a8;
-    --danger: #f7634f; --warning: #f7c44f; --success: #4ff7a0;
-  }
-  * { margin: 0; padding: 0; box-sizing: border-box; }
-  body { background: var(--bg); color: var(--text); font-family: 'DM Sans', sans-serif; min-height: 100vh; }
-  header { padding: 20px 40px; border-bottom: 1px solid var(--border); background: var(--surface); display: flex; align-items: center; justify-content: space-between; gap: 16px; flex-wrap: wrap; }
-  .logo { display: flex; align-items: center; gap: 12px; }
-  .logo-icon { width: 36px; height: 36px; background: var(--accent); border-radius: 8px; display: flex; align-items: center; justify-content: center; font-size: 18px; }
-  .logo-text { font-size: 18px; font-weight: 600; }
-  .logo-sub { font-size: 12px; color: var(--text2); font-family: 'DM Mono', monospace; }
-  .global-controls { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
-  .filter-label { font-size: 12px; color: var(--text2); }
-  .period-buttons { display: flex; gap: 8px; flex-wrap: wrap; }
-  .filter-btn { background: var(--bg); border: 1px solid var(--border); color: var(--text2); padding: 6px 12px; border-radius: 6px; font-size: 12px; cursor: pointer; font-family: 'DM Sans', sans-serif; transition: all 0.15s; }
-  .filter-btn:hover { border-color: var(--accent); color: var(--text); }
-  .filter-btn.active { background: var(--accent); border-color: var(--accent); color: white; }
-  .header-right { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
-  .date-badge { font-family: 'DM Mono', monospace; font-size: 11px; color: var(--text2); background: var(--bg); padding: 6px 10px; border-radius: 6px; border: 1px solid var(--border); }
-  .refresh-btn { background: var(--surface2); color: var(--text); border: 1px solid var(--border); padding: 7px 14px; border-radius: 6px; font-size: 12px; font-weight: 500; cursor: pointer; font-family: 'DM Sans', sans-serif; transition: all 0.15s; }
-  .refresh-btn:hover { border-color: var(--accent); color: var(--accent); }
-  .select-input, .date-input { background: var(--bg); border: 1px solid var(--border); color: var(--text); padding: 7px 10px; border-radius: 6px; font-size: 12px; font-family: 'DM Sans', sans-serif; }
-  .custom-range { display: none; align-items: center; gap: 8px; flex-wrap: wrap; }
-  .custom-range.active { display: flex; }
-  main { padding: 28px 40px; max-width: 1400px; margin: 0 auto; }
-  .kpi-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 16px; margin-bottom: 28px; }
-  .kpi-card { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 22px; position: relative; overflow: hidden; }
-  .kpi-card::before { content: ''; position: absolute; top: 0; left: 0; right: 0; height: 2px; }
-  .kpi-card.blue::before { background: var(--accent); }
-  .kpi-card.red::before { background: var(--accent2); }
-  .kpi-card.green::before { background: var(--accent3); }
-  .kpi-label { font-size: 11px; color: var(--text2); text-transform: uppercase; letter-spacing: 1px; font-weight: 500; margin-bottom: 10px; }
-  .kpi-value { font-size: 28px; font-weight: 600; letter-spacing: -0.5px; margin-bottom: 6px; }
-  .kpi-value.blue { color: var(--accent); }
-  .kpi-value.red { color: var(--accent2); }
-  .kpi-value.green { color: var(--accent3); }
-  .kpi-bottom { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
-  .kpi-sub { font-size: 11px; color: var(--text2); font-family: 'DM Mono', monospace; }
-  .pct-badge { font-size: 11px; font-weight: 600; padding: 2px 7px; border-radius: 4px; font-family: 'DM Mono', monospace; }
-  .pct-up { background: rgba(79,247,160,0.15); color: var(--success); }
-  .pct-down { background: rgba(247,99,79,0.15); color: var(--danger); }
-  .pct-neutral { background: rgba(136,144,168,0.15); color: var(--text2); }
-  .charts-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; margin-bottom: 20px; }
-  .chart-card { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 22px; }
-  .card-header { display: flex; align-items: flex-start; justify-content: space-between; margin-bottom: 16px; gap: 12px; flex-wrap: wrap; }
-  .card-title { font-size: 14px; font-weight: 600; margin-bottom: 3px; }
-  .card-sub { font-size: 11px; color: var(--text2); font-family: 'DM Mono', monospace; }
-  .compare-toggle { display: flex; align-items: center; gap: 6px; }
-  .compare-toggle label { font-size: 11px; color: var(--text2); cursor: pointer; }
-  .compare-toggle input { cursor: pointer; accent-color: var(--accent); }
-  canvas { max-height: 240px; }
-  .table-card { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 22px; margin-bottom: 20px; }
-  table { width: 100%; border-collapse: collapse; margin-top: 4px; }
-  thead th { text-align: left; font-size: 11px; color: var(--text2); text-transform: uppercase; letter-spacing: 1px; padding: 8px 12px; border-bottom: 1px solid var(--border); font-weight: 500; }
-  tbody tr { border-bottom: 1px solid var(--border); transition: background 0.15s; }
-  tbody tr:hover { background: var(--surface2); }
-  tbody tr:last-child { border-bottom: none; }
-  tbody td { padding: 11px 12px; font-size: 13px; }
-  .retard-badge { display: inline-block; padding: 2px 8px; border-radius: 4px; font-family: 'DM Mono', monospace; font-size: 11px; font-weight: 500; }
-  .retard-low { background: rgba(247,196,79,0.15); color: var(--warning); }
-  .retard-mid { background: rgba(247,99,79,0.15); color: var(--danger); }
-  .retard-high { background: rgba(247,99,79,0.3); color: var(--danger); }
-  .status-badge { display: inline-block; padding: 2px 8px; border-radius: 4px; font-family: 'DM Mono', monospace; font-size: 11px; font-weight: 500; background: rgba(79,142,247,0.15); color: var(--accent); }
-  .success-badge { background: rgba(79,247,160,0.15); color: var(--success); }
-  .montant { font-family: 'DM Mono', monospace; font-size: 13px; font-weight: 500; }
-  .link-btn { color: var(--accent); text-decoration: none; border: 1px solid var(--border); padding: 4px 8px; border-radius: 6px; font-size: 11px; }
-  .link-btn:hover { border-color: var(--accent); }
-  .loading, .empty-state, .error-state { display: flex; align-items: center; justify-content: center; min-height: 160px; color: var(--text2); font-size: 13px; gap: 10px; text-align: center; padding: 20px; }
-  .error-state { color: #ffb4a7; }
-  .spinner { width: 16px; height: 16px; border: 2px solid var(--border); border-top-color: var(--accent); border-radius: 50%; animation: spin 0.8s linear infinite; }
-  .split-list { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
-  .mini-table-title { font-size: 12px; font-weight: 600; margin-bottom: 8px; color: var(--text); }
-  .compare-only { display: none; }
-  .compare-only.active { display: inline; }
-  @keyframes spin { to { transform: rotate(360deg); } }
-  @media (max-width: 900px) {
-    .kpi-grid, .charts-grid, .split-list { grid-template-columns: 1fr; }
-    main { padding: 16px; }
-    header { padding: 16px; }
-  }
+:root {
+  /* ConiMind exact palette */
+  --bg:        #0c0e1a;
+  --bg2:       #111422;
+  --surface:   #161929;
+  --surface2:  #1c2035;
+  --border:    #252840;
+  --border2:   #2e3350;
+
+  /* Brand orange — ConiMind signature */
+  --orange:    #f5a623;
+  --orange2:   #ffbe4f;
+  --orange-glow: rgba(245,166,35,.15);
+  --orange-dim:  rgba(245,166,35,.08);
+
+  /* Status */
+  --success:   #34d399;
+  --warning:   #fbbf24;
+  --danger:    #f87171;
+  --info:      #60a5fa;
+
+  /* Text */
+  --text:      #f0f2fa;
+  --text2:     #7c84a8;
+  --text3:     #404666;
+
+  --radius:    16px;
+  --radius-sm: 10px;
+}
+
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+body { background: var(--bg); color: var(--text); font-family: 'Outfit', sans-serif; min-height: 100vh; }
+
+/* scrollbar */
+::-webkit-scrollbar { width: 5px; height: 5px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: var(--border2); border-radius: 3px; }
+
+/* ── HEADER ── */
+header {
+  position: sticky; top: 0; z-index: 100;
+  background: rgba(12,14,26,.9);
+  backdrop-filter: blur(24px);
+  border-bottom: 1px solid var(--border);
+  padding: 0 36px;
+  height: 66px;
+  display: flex; align-items: center; justify-content: space-between; gap: 20px;
+}
+
+.logo {
+  display: flex; align-items: center; gap: 11px; text-decoration: none;
+  flex-shrink: 0;
+}
+.logo-mark {
+  width: 38px; height: 38px;
+  background: linear-gradient(135deg, #f5a623, #ffbe4f);
+  border-radius: 10px;
+  display: flex; align-items: center; justify-content: center;
+  font-size: 18px;
+  box-shadow: 0 0 24px var(--orange-glow);
+}
+.logo-name { font-size: 17px; font-weight: 800; letter-spacing: -.4px; color: var(--text); }
+.logo-tag  { font-size: 10px; color: var(--text2); font-family: 'JetBrains Mono', monospace; letter-spacing: .5px; }
+
+.controls { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+
+.pill-group {
+  display: flex; background: var(--surface2); border: 1px solid var(--border);
+  border-radius: 10px; overflow: hidden; padding: 3px;
+}
+.pill {
+  padding: 6px 18px; font-size: 12px; font-weight: 600; cursor: pointer;
+  border: none; background: transparent; color: var(--text2);
+  font-family: 'Outfit', sans-serif; border-radius: 8px; transition: all .15s;
+}
+.pill:hover { color: var(--text); }
+.pill.active { background: var(--orange); color: #0c0e1a; box-shadow: 0 2px 10px var(--orange-glow); }
+
+.select-ctrl {
+  background: var(--surface); border: 1px solid var(--border); color: var(--text);
+  padding: 8px 12px; border-radius: var(--radius-sm); font-size: 12px;
+  font-family: 'Outfit', sans-serif; cursor: pointer; min-width: 170px;
+}
+.select-ctrl:focus { outline: none; border-color: var(--orange); }
+
+.cmp-label {
+  display: flex; align-items: center; gap: 7px;
+  font-size: 12px; color: var(--text2); cursor: pointer; user-select: none;
+}
+.cmp-label input { accent-color: var(--orange); cursor: pointer; }
+
+.header-right { display: flex; align-items: center; gap: 10px; flex-shrink: 0; }
+.date-chip {
+  font-family: 'JetBrains Mono', monospace; font-size: 11px; color: var(--text2);
+  background: var(--surface2); padding: 6px 12px; border-radius: 8px; border: 1px solid var(--border);
+}
+.btn-refresh {
+  background: transparent; border: 1px solid var(--border); color: var(--text2);
+  padding: 7px 14px; border-radius: var(--radius-sm); font-size: 13px; cursor: pointer;
+  transition: all .15s;
+}
+.btn-refresh:hover { border-color: var(--orange); color: var(--orange); }
+
+/* ── MAIN ── */
+main { padding: 30px 36px; max-width: 1440px; margin: 0 auto; }
+
+/* ── SECTION LABEL ── */
+.sec-label {
+  font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: 2px;
+  color: var(--orange); margin-bottom: 16px; display: flex; align-items: center; gap: 10px;
+}
+.sec-label::after { content:''; flex:1; height:1px; background:var(--border); }
+
+/* ── KPIs ── */
+.kpi-grid { display: grid; grid-template-columns: repeat(4,1fr); gap: 14px; margin-bottom: 30px; }
+
+.kpi {
+  background: var(--surface); border: 1px solid var(--border);
+  border-radius: var(--radius); padding: 24px 20px;
+  position: relative; overflow: hidden; transition: border-color .2s, transform .2s;
+}
+.kpi:hover { border-color: var(--border2); transform: translateY(-2px); }
+
+/* glowing top border */
+.kpi::before {
+  content:''; position:absolute; top:0; left:0; right:0; height:2px; border-radius:var(--radius) var(--radius) 0 0;
+}
+.kpi.k-orange::before  { background: linear-gradient(90deg, var(--orange), var(--orange2)); }
+.kpi.k-green::before   { background: linear-gradient(90deg, var(--success), #6ee7b7); }
+.kpi.k-blue::before    { background: linear-gradient(90deg, var(--info), #93c5fd); }
+.kpi.k-red::before     { background: linear-gradient(90deg, var(--danger), #fca5a5); }
+
+/* subtle bg glow */
+.kpi.k-orange::after { content:''; position:absolute; bottom:-40px; right:-20px; width:120px; height:120px; border-radius:50%; background:var(--orange-dim); filter:blur(30px); }
+
+.kpi-icon {
+  width: 40px; height: 40px; border-radius: 10px;
+  display: flex; align-items: center; justify-content: center; font-size: 18px; margin-bottom: 16px;
+}
+.k-orange .kpi-icon { background: var(--orange-dim); }
+.k-green  .kpi-icon { background: rgba(52,211,153,.1); }
+.k-blue   .kpi-icon { background: rgba(96,165,250,.1); }
+.k-red    .kpi-icon { background: rgba(248,113,113,.1); }
+
+.kpi-label { font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: 1px; color: var(--text2); margin-bottom: 8px; }
+.kpi-value { font-size: 27px; font-weight: 800; letter-spacing: -1px; line-height: 1; margin-bottom: 10px; }
+.k-orange .kpi-value { color: var(--orange); }
+.k-green  .kpi-value { color: var(--success); }
+.k-blue   .kpi-value { color: var(--info); }
+.k-red    .kpi-value { color: var(--danger); }
+
+.kpi-foot { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.kpi-sub  { font-size: 11px; color: var(--text2); font-family: 'JetBrains Mono', monospace; }
+
+.badge {
+  font-size: 10px; font-weight: 700; padding: 2px 8px; border-radius: 100px;
+  font-family: 'JetBrains Mono', monospace;
+}
+.b-up   { background: rgba(52,211,153,.12); color: var(--success); }
+.b-down { background: rgba(248,113,113,.12); color: var(--danger); }
+.b-flat { background: rgba(124,132,168,.12); color: var(--text2); }
+
+/* ── CHARTS ── */
+.charts-row { display: grid; grid-template-columns: 1.4fr 1fr; gap: 16px; margin-bottom: 30px; }
+
+.card {
+  background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: 26px;
+}
+.card-head { display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 22px; }
+.card-title { font-size: 15px; font-weight: 700; margin-bottom: 4px; }
+.card-sub   { font-size: 11px; color: var(--text2); font-family: 'JetBrains Mono', monospace; }
+canvas { max-height: 220px; }
+
+/* ── INVOICE SECTION ── */
+.inv-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 16px; flex-wrap: wrap; gap: 12px; }
+
+.inv-tabs { display: flex; gap: 3px; background: var(--surface2); border: 1px solid var(--border); border-radius: 12px; padding: 4px; }
+.inv-tab {
+  padding: 7px 18px; border-radius: 9px; font-size: 12px; font-weight: 600;
+  cursor: pointer; border: none; background: transparent; color: var(--text2);
+  font-family: 'Outfit', sans-serif; transition: all .15s; white-space: nowrap;
+}
+.inv-tab:hover { color: var(--text); }
+.inv-tab.active { background: var(--orange); color: #0c0e1a; box-shadow: 0 2px 10px var(--orange-glow); }
+
+.tab-cnt {
+  display: inline-block; margin-left: 6px; background: rgba(255,255,255,.15);
+  padding: 1px 6px; border-radius: 100px; font-size: 10px;
+}
+.inv-tab.active .tab-cnt { background: rgba(12,14,26,.2); }
+
+/* ── TABLE ── */
+.tbl-wrap { overflow-x: auto; }
+table { width: 100%; border-collapse: collapse; }
+thead th {
+  text-align: left; font-size: 10px; font-weight: 700; text-transform: uppercase;
+  letter-spacing: 1.2px; color: var(--text3); padding: 10px 14px;
+  border-bottom: 1px solid var(--border);
+}
+tbody tr { border-bottom: 1px solid var(--border); transition: background .12s; }
+tbody tr:hover { background: var(--surface2); }
+tbody tr:last-child { border-bottom: none; }
+tbody td { padding: 12px 14px; font-size: 13px; }
+
+.mono  { font-family: 'JetBrains Mono', monospace; font-size: 12px; }
+.muted { color: var(--text2); }
+
+.s-pill {
+  display: inline-flex; align-items: center; gap: 5px;
+  padding: 3px 10px; border-radius: 100px; font-size: 11px; font-weight: 600;
+}
+.s-pill::before { content:''; width:5px; height:5px; border-radius:50%; background:currentColor; }
+.s-paid    { background: rgba(52,211,153,.1);  color: var(--success); }
+.s-pending { background: rgba(245,166,35,.1);  color: var(--orange); }
+.s-overdue { background: rgba(248,113,113,.1); color: var(--danger); }
+
+.d-pill {
+  display: inline-block; padding: 2px 9px; border-radius: 7px;
+  font-family: 'JetBrains Mono', monospace; font-size: 11px; font-weight: 700;
+}
+.d-low  { background: rgba(251,191,36,.1);  color: var(--warning); }
+.d-mid  { background: rgba(248,113,113,.1); color: var(--danger); }
+.d-high { background: rgba(248,113,113,.2); color: var(--danger); }
+
+.link-btn {
+  color: var(--orange); text-decoration: none; border: 1px solid var(--border);
+  padding: 4px 11px; border-radius: 7px; font-size: 11px; font-weight: 600;
+  transition: all .15s;
+}
+.link-btn:hover { border-color: var(--orange); background: var(--orange-dim); }
+
+/* ── STATES ── */
+.state-box {
+  min-height: 140px; display: flex; align-items: center; justify-content: center;
+  color: var(--text2); font-size: 13px; gap: 10px;
+}
+.state-box.err { color: #fca5a5; }
+.spin {
+  width: 16px; height: 16px; border: 2px solid var(--border2); border-top-color: var(--orange);
+  border-radius: 50%; animation: spin .7s linear infinite;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+
+/* ── RESPONSIVE ── */
+@media (max-width: 1024px) {
+  .kpi-grid   { grid-template-columns: repeat(2,1fr); }
+  .charts-row { grid-template-columns: 1fr; }
+}
+@media (max-width: 600px) {
+  .kpi-grid { grid-template-columns: 1fr; }
+  main, header { padding-left: 16px; padding-right: 16px; }
+  header { height: auto; padding-top: 12px; padding-bottom: 12px; flex-wrap: wrap; }
+}
 </style>
 </head>
 <body>
+
 <header>
-  <div class="logo">
-    <div class="logo-icon">📊</div>
+  <a class="logo" href="https://www.conimind.com" target="_blank">
+    <div class="logo-mark">🧠</div>
     <div>
-      <div class="logo-text">Odoo Dashboard</div>
-      <div class="logo-sub">{{ db }}</div>
+      <div class="logo-name">ConiMind</div>
+      <div class="logo-tag">{{ db }} · dashboard</div>
     </div>
-  </div>
+  </a>
 
-  <div class="global-controls">
-    <span class="filter-label">Période :</span>
-    <div class="period-buttons">
-      <button class="filter-btn" data-period="today" onclick="setPeriod('today')">Aujourd'hui</button>
-      <button class="filter-btn" data-period="week" onclick="setPeriod('week')">Semaine</button>
-      <button class="filter-btn active" data-period="month" onclick="setPeriod('month')">Mois</button>
-      <button class="filter-btn" data-period="quarter" onclick="setPeriod('quarter')">Trimestre</button>
-      <button class="filter-btn" data-period="year" onclick="setPeriod('year')">Année</button>
-      <button class="filter-btn" data-period="custom" onclick="setPeriod('custom')">Personnalisé</button>
+  <div class="controls">
+    <div class="pill-group">
+      <button class="pill active" data-p="month" onclick="setPeriod('month',this)">Ce mois</button>
+      <button class="pill"        data-p="year"  onclick="setPeriod('year',this)">Cette année</button>
     </div>
 
-    <div class="custom-range" id="customRange">
-      <input class="date-input" type="date" id="dateStart">
-      <span class="filter-label">au</span>
-      <input class="date-input" type="date" id="dateEnd">
-      <button class="refresh-btn" onclick="applyCustomRange()">Appliquer</button>
-    </div>
-
-    <span class="filter-label">Client :</span>
-    <select class="select-input" id="clientFilter" onchange="loadAll()">
+    <select class="select-ctrl" id="clientFilter" onchange="load()">
       <option value="">Tous les clients</option>
     </select>
 
-    <div class="compare-toggle">
-      <input type="checkbox" id="compareGlobal" onchange="loadAll()">
-      <label for="compareGlobal">Comparer à N-1</label>
-    </div>
+    <label class="cmp-label">
+      <input type="checkbox" id="cmpToggle" onchange="load()">
+      Comparer N-1
+    </label>
   </div>
 
   <div class="header-right">
-    <div class="date-badge" id="dateBadge">—</div>
-    <button class="refresh-btn" onclick="refreshAll()">↻ Actualiser</button>
+    <div class="date-chip" id="dateChip">—</div>
+    <button class="btn-refresh" onclick="hardRefresh()" title="Actualiser">↻</button>
   </div>
 </header>
 
 <main>
+
+  <!-- KPIs -->
+  <div class="sec-label">Vue globale</div>
   <div class="kpi-grid">
-    <div class="kpi-card blue">
-      <div class="kpi-label">CA</div>
-      <div class="kpi-value blue" id="kpiCA">—</div>
-      <div class="kpi-bottom">
-        <div class="kpi-sub" id="kpiCASub">Chargement...</div>
-        <div id="kpiCAPct"></div>
-      </div>
+    <div class="kpi k-orange">
+      <div class="kpi-icon">💶</div>
+      <div class="kpi-label">CA facturé HTVA</div>
+      <div class="kpi-value" id="kCA">—</div>
+      <div class="kpi-foot"><span class="kpi-sub" id="kCAsub">…</span><span id="kCApct"></span></div>
     </div>
-    <div class="kpi-card red">
-      <div class="kpi-label">Factures en retard</div>
-      <div class="kpi-value red" id="kpiRetard">—</div>
-      <div class="kpi-bottom">
-        <div class="kpi-sub" id="kpiRetardSub">Chargement...</div>
-        <div id="kpiRetardPct"></div>
-      </div>
+    <div class="kpi k-green">
+      <div class="kpi-icon">✅</div>
+      <div class="kpi-label">Factures payées</div>
+      <div class="kpi-value" id="kPaid">—</div>
+      <div class="kpi-foot"><span class="kpi-sub" id="kPaidsub">…</span><span id="kPaidpct"></span></div>
     </div>
-    <div class="kpi-card green">
-      <div class="kpi-label">Devis en cours</div>
-      <div class="kpi-value green" id="kpiQuotes">—</div>
-      <div class="kpi-bottom">
-        <div class="kpi-sub" id="kpiQuotesSub">Chargement...</div>
-        <div id="kpiQuotesPct"></div>
-      </div>
+    <div class="kpi k-blue">
+      <div class="kpi-icon">⏳</div>
+      <div class="kpi-label">En attente</div>
+      <div class="kpi-value" id="kPending">—</div>
+      <div class="kpi-foot"><span class="kpi-sub" id="kPendingsub">…</span><span id="kPendingpct"></span></div>
     </div>
-    <div class="kpi-card green">
-      <div class="kpi-label">Bons à facturer</div>
-      <div class="kpi-value green" id="kpiOrders">—</div>
-      <div class="kpi-bottom">
-        <div class="kpi-sub" id="kpiOrdersSub">Chargement...</div>
-        <div id="kpiOrdersPct"></div>
-      </div>
+    <div class="kpi k-red">
+      <div class="kpi-icon">🚨</div>
+      <div class="kpi-label">En retard</div>
+      <div class="kpi-value" id="kOverdue">—</div>
+      <div class="kpi-foot"><span class="kpi-sub" id="kOverduesub">…</span><span id="kOverduepct"></span></div>
     </div>
   </div>
 
-  <div class="charts-grid">
-    <div class="chart-card">
-      <div class="card-header">
+  <!-- Charts -->
+  <div class="charts-row">
+    <div class="card">
+      <div class="card-head">
         <div>
-          <div class="card-title">Chiffre d'affaires</div>
-          <div class="card-sub" id="caChartSub">Top 5 clients + autres</div>
+          <div class="card-title">Évolution du CA</div>
+          <div class="card-sub" id="subMonthly">12 derniers mois · HTVA</div>
         </div>
       </div>
-      <canvas id="chartCA"></canvas>
+      <canvas id="chartMonthly"></canvas>
     </div>
-    <div class="chart-card">
-      <div class="card-header">
+    <div class="card">
+      <div class="card-head">
         <div>
-          <div class="card-title">Devis et bons à facturer</div>
-          <div class="card-sub" id="salesChartSub">Montants HTVA</div>
+          <div class="card-title">Top clients</div>
+          <div class="card-sub" id="subTop">CA HTVA · période sélectionnée</div>
         </div>
       </div>
-      <canvas id="chartSales"></canvas>
+      <canvas id="chartTop"></canvas>
     </div>
   </div>
 
-  <div class="table-card">
-    <div class="card-header">
-      <div>
-        <div class="card-title">Factures en retard</div>
-        <div class="card-sub" id="retardTableSub">Factures impayées dont l'échéance est dépassée</div>
-      </div>
+  <!-- Invoice tracker -->
+  <div class="inv-header">
+    <div class="sec-label" style="margin-bottom:0;flex:1">Suivi des factures client</div>
+    <div class="inv-tabs">
+      <button class="inv-tab active" onclick="showTab('all',this)">
+        Toutes <span class="tab-cnt" id="cnt-all">—</span>
+      </button>
+      <button class="inv-tab" onclick="showTab('pending',this)">
+        En attente <span class="tab-cnt" id="cnt-pending">—</span>
+      </button>
+      <button class="inv-tab" onclick="showTab('overdue',this)">
+        En retard <span class="tab-cnt" id="cnt-overdue">—</span>
+      </button>
+      <button class="inv-tab" onclick="showTab('paid',this)">
+        Payées <span class="tab-cnt" id="cnt-paid">—</span>
+      </button>
     </div>
-    <div id="tableRetard"><div class="loading"><div class="spinner"></div> Chargement...</div></div>
+  </div>
+  <div class="card" style="padding:16px 20px">
+    <div id="invTable"><div class="state-box"><div class="spin"></div> Chargement…</div></div>
   </div>
 
-  <div class="table-card">
-    <div class="card-header">
-      <div>
-        <div class="card-title">Détail commercial</div>
-        <div class="card-sub" id="salesTableSub">Devis en cours et bons à facturer</div>
-      </div>
-    </div>
-    <div id="tableSales"><div class="loading"><div class="spinner"></div> Chargement...</div></div>
-  </div>
 </main>
 
 <script>
-let chartCA = null, chartSales = null;
-let globalPeriod = 'month';
-let currentCustomStart = '';
-let currentCustomEnd = '';
+let period = 'month';
+let activeTab = 'all';
+let invData = null;
+let chM = null, chT = null;
 
-function fmt(n) {
-  return new Intl.NumberFormat('fr-BE', { style: 'currency', currency: 'EUR', maximumFractionDigits: 0 }).format(n || 0);
+const EUR = n => new Intl.NumberFormat('fr-BE',{style:'currency',currency:'EUR',maximumFractionDigits:0}).format(n||0);
+
+function badge(p) {
+  if (p===null||p===undefined) return '';
+  const cls = p>0?'b-up':p<0?'b-down':'b-flat';
+  return `<span class="badge ${cls}">${p>0?'+':''}${p}% N-1</span>`;
 }
 
-function pctBadge(pct) {
-  if (pct === null || pct === undefined) return '';
-  const cls = pct > 0 ? 'pct-up' : pct < 0 ? 'pct-down' : 'pct-neutral';
-  const sign = pct > 0 ? '+' : '';
-  return `<span class="pct-badge ${cls}">${sign}${pct}% vs N-1</span>`;
+function setPeriod(p, btn) {
+  period = p;
+  document.querySelectorAll('.pill').forEach(b=>b.classList.toggle('active', b.dataset.p===p));
+  load();
 }
 
-function buildQuery() {
-  const params = new URLSearchParams();
-  params.set('period', globalPeriod);
-  if (globalPeriod === 'custom') {
-    params.set('date_start', currentCustomStart);
-    params.set('date_end', currentCustomEnd);
-  }
-  const partnerId = document.getElementById('clientFilter').value;
-  if (partnerId) params.set('partner_id', partnerId);
-  return params.toString();
+function showTab(tab, btn) {
+  activeTab = tab;
+  document.querySelectorAll('.inv-tab').forEach(b=>b.classList.remove('active'));
+  if(btn) btn.classList.add('active');
+  renderTable();
 }
 
-async function fetchJson(url) {
-  const response = await fetch(url);
-  const data = await response.json();
-  if (!response.ok || data.error) {
-    throw new Error(data.error || `Erreur HTTP ${response.status}`);
-  }
-  return data;
+function buildQ() {
+  const p = new URLSearchParams({period});
+  const pid = document.getElementById('clientFilter').value;
+  if(pid) p.set('partner_id',pid);
+  return p.toString();
 }
 
-function showError(targetId, error) {
-  document.getElementById(targetId).innerHTML = `<div class="error-state">⚠️ ${error.message}</div>`;
-}
-
-function setPeriod(period) {
-  globalPeriod = period;
-  document.querySelectorAll('.filter-btn').forEach(btn => {
-    btn.classList.toggle('active', btn.dataset.period === period);
-  });
-  document.getElementById('customRange').classList.toggle('active', period === 'custom');
-  if (period !== 'custom') {
-    loadAll();
-  }
-}
-
-function applyCustomRange() {
-  const start = document.getElementById('dateStart').value;
-  const end = document.getElementById('dateEnd').value;
-  if (!start || !end) {
-    alert('Choisis une date de début et une date de fin.');
-    return;
-  }
-  currentCustomStart = start;
-  currentCustomEnd = end;
-  loadAll();
+async function fetchJ(url) {
+  const r = await fetch(url);
+  const d = await r.json();
+  if(!r.ok||d.error) throw new Error(d.error||`HTTP ${r.status}`);
+  return d;
 }
 
 async function loadClients() {
   try {
-    const data = await fetchJson('/api/clients');
-    const select = document.getElementById('clientFilter');
-    const current = select.value;
-    select.innerHTML = '<option value="">Tous les clients</option>';
-    data.clients.forEach(client => {
-      const option = document.createElement('option');
-      option.value = client.id;
-      option.textContent = client.name;
-      select.appendChild(option);
+    const d = await fetchJ('/api/clients');
+    const sel = document.getElementById('clientFilter');
+    const cur = sel.value;
+    sel.innerHTML = '<option value="">Tous les clients</option>';
+    d.clients.forEach(c=>{
+      const o=document.createElement('option');
+      o.value=c.id; o.textContent=c.name; sel.appendChild(o);
     });
-    select.value = current;
-  } catch (error) {
-    console.error(error);
-  }
+    sel.value = cur;
+  } catch(e){ console.error(e); }
 }
 
-async function loadCA() {
+async function load() {
+  document.getElementById('dateChip').textContent =
+    new Date().toLocaleDateString('fr-BE',{weekday:'short',year:'numeric',month:'long',day:'numeric'});
+  document.getElementById('invTable').innerHTML =
+    '<div class="state-box"><div class="spin"></div> Chargement…</div>';
+
   try {
-    const query = buildQuery();
-    const data = await fetchJson(`/api/ca?${query}`);
-    const compare = document.getElementById('compareGlobal').checked;
+    invData = await fetchJ(`/api/invoices?${buildQ()}`);
+    const d = invData;
+    const cmp = document.getElementById('cmpToggle').checked;
 
-    document.getElementById('kpiCA').textContent = fmt(data.total);
-    document.getElementById('kpiCASub').textContent = `${data.labels.length} poste(s) — ${data.period_label}`;
-    document.getElementById('kpiCAPct').innerHTML = compare ? pctBadge(data.pct) : '';
-    document.getElementById('caChartSub').textContent = `Top 5 clients + autres — ${data.period_label}`;
+    // KPIs
+    document.getElementById('kCA').textContent      = EUR(d.ca);
+    document.getElementById('kCAsub').textContent   = `${d.total_n} facture(s) — ${d.period}`;
+    document.getElementById('kCApct').innerHTML     = cmp ? badge(d.ca_pct) : '';
 
-    if (chartCA) chartCA.destroy();
-    const datasets = [{
-      label: 'Période actuelle',
-      data: data.values,
-      backgroundColor: 'rgba(79,142,247,0.7)',
-      borderColor: 'rgba(79,142,247,1)',
-      borderWidth: 1,
-      borderRadius: 4
-    }];
+    document.getElementById('kPaid').textContent     = EUR(d.paid);
+    document.getElementById('kPaidsub').textContent  = `${d.paid_n} facture(s)`;
+    document.getElementById('kPaidpct').innerHTML    = cmp ? badge(d.paid_pct) : '';
 
-    if (compare) {
-      datasets.push({
-        label: 'Année précédente',
-        data: data.prev_values,
-        backgroundColor: 'rgba(79,142,247,0.2)',
-        borderColor: 'rgba(79,142,247,0.5)',
-        borderWidth: 1,
-        borderRadius: 4
-      });
-    }
+    document.getElementById('kPending').textContent    = EUR(d.pending);
+    document.getElementById('kPendingsub').textContent = `${d.pending_n} facture(s)`;
+    document.getElementById('kPendingpct').innerHTML   = cmp ? badge(d.pending_pct) : '';
 
-    chartCA = new Chart(document.getElementById('chartCA'), {
-      type: 'bar',
-      data: { labels: data.labels, datasets },
-      options: {
-        responsive: true,
-        plugins: {
-          legend: { display: compare, labels: { color: '#8890a8', font: { size: 11 } } }
-        },
-        scales: {
-          x: { ticks: { color: '#8890a8', font: { size: 10 } }, grid: { color: '#2a2f45' } },
-          y: { ticks: { color: '#8890a8', font: { size: 10 }, callback: v => fmt(v) }, grid: { color: '#2a2f45' } }
-        }
-      }
-    });
-  } catch (error) {
-    showError('chartCA', error);
-    document.getElementById('kpiCASub').textContent = 'Erreur';
-  }
-}
+    document.getElementById('kOverdue').textContent    = EUR(d.overdue);
+    document.getElementById('kOverduesub').textContent = `${d.overdue_n} facture(s)`;
+    document.getElementById('kOverduepct').innerHTML   = cmp ? badge(d.overdue_pct) : '';
 
-async function loadSales() {
-  try {
-    const query = buildQuery();
-    const data = await fetchJson(`/api/sales?${query}`);
-    const compare = document.getElementById('compareGlobal').checked;
+    // Tab counts
+    const allRows = [...d.detail.overdue,...d.detail.pending,...d.detail.paid];
+    document.getElementById('cnt-all').textContent     = allRows.length;
+    document.getElementById('cnt-pending').textContent = d.detail.pending.length;
+    document.getElementById('cnt-overdue').textContent = d.detail.overdue.length;
+    document.getElementById('cnt-paid').textContent    = d.detail.paid.length;
 
-    document.getElementById('kpiQuotes').textContent = fmt(data.quote_total);
-    document.getElementById('kpiQuotesSub').textContent = `${data.quote_count} devis — ${data.period_label}`;
-    document.getElementById('kpiQuotesPct').innerHTML = compare ? pctBadge(data.quote_pct) : '';
-
-    document.getElementById('kpiOrders').textContent = fmt(data.order_total);
-    document.getElementById('kpiOrdersSub').textContent = `${data.order_count} commande(s) — ${data.period_label}`;
-    document.getElementById('kpiOrdersPct').innerHTML = compare ? pctBadge(data.order_pct) : '';
-
-    document.getElementById('salesChartSub').textContent = `Montants HTVA — ${data.period_label}`;
-    document.getElementById('salesTableSub').textContent = `Devis en cours et bons à facturer — ${data.period_label}`;
-
-    if (chartSales) chartSales.destroy();
-    const datasets = [{
-      label: 'Période actuelle',
-      data: data.values,
-      backgroundColor: ['rgba(79,142,247,0.75)','rgba(79,247,160,0.75)'],
-      borderRadius: 6
-    }];
-
-    if (compare) {
-      datasets.push({
-        label: 'Année précédente',
-        data: data.prev_values,
-        backgroundColor: ['rgba(79,142,247,0.25)','rgba(79,247,160,0.25)'],
-        borderRadius: 6
-      });
-    }
-
-    chartSales = new Chart(document.getElementById('chartSales'), {
-      type: 'bar',
-      data: { labels: data.labels, datasets },
-      options: {
-        responsive: true,
-        plugins: {
-          legend: { display: compare, labels: { color: '#8890a8', font: { size: 11 } } }
-        },
-        scales: {
-          x: { ticks: { color: '#8890a8', font: { size: 10 } }, grid: { color: '#2a2f45' } },
-          y: { ticks: { color: '#8890a8', font: { size: 10 }, callback: v => fmt(v) }, grid: { color: '#2a2f45' } }
+    // Monthly chart
+    if(chM) chM.destroy();
+    chM = new Chart(document.getElementById('chartMonthly'),{
+      type:'line',
+      data:{
+        labels:d.monthly_labels,
+        datasets:[{
+          label:'CA HTVA',
+          data:d.monthly_values,
+          borderColor:'#f5a623',
+          backgroundColor:'rgba(245,166,35,.07)',
+          borderWidth:2.5, fill:true, tension:.4,
+          pointBackgroundColor:'#f5a623',
+          pointRadius:3, pointHoverRadius:6,
+        }]
+      },
+      options:{
+        responsive:true,
+        plugins:{legend:{display:false}},
+        scales:{
+          x:{ticks:{color:'#7c84a8',font:{size:10}},grid:{color:'#252840'}},
+          y:{ticks:{color:'#7c84a8',font:{size:10},callback:v=>EUR(v)},grid:{color:'#252840'}}
         }
       }
     });
 
-    const renderSection = (title, rows, statusClass) => {
-      if (!rows.length) {
-        return `<div><div class="mini-table-title">${title}</div><div class="empty-state">${title === 'Devis en cours' ? 'Aucun devis en cours sur la période' : 'Aucun bon à facturer sur la période'}</div></div>`;
+    // Top clients
+    if(chT) chT.destroy();
+    chT = new Chart(document.getElementById('chartTop'),{
+      type:'bar',
+      data:{
+        labels:d.top_labels,
+        datasets:[{
+          data:d.top_values,
+          backgroundColor:[
+            'rgba(245,166,35,.8)','rgba(52,211,153,.7)','rgba(96,165,250,.7)',
+            'rgba(248,113,113,.7)','rgba(167,139,250,.7)','rgba(251,191,36,.7)',
+            'rgba(52,211,153,.5)','rgba(245,166,35,.5)',
+          ],
+          borderRadius:5, borderWidth:0,
+        }]
+      },
+      options:{
+        indexAxis:'y', responsive:true,
+        plugins:{legend:{display:false}},
+        scales:{
+          x:{ticks:{color:'#7c84a8',font:{size:10},callback:v=>EUR(v)},grid:{color:'#252840'}},
+          y:{ticks:{color:'#7c84a8',font:{size:10}},grid:{display:false}}
+        }
       }
-      let html = `<div><div class="mini-table-title">${title}</div><table><thead><tr><th>Numéro</th><th>Client</th><th>Montant</th><th>Date</th><th>Statut</th><th></th></tr></thead><tbody>`;
-      for (const r of rows) {
-        html += `<tr>
-          <td><span style="font-family:monospace;font-size:12px;color:#8890a8">${r.numero}</span></td>
-          <td>${r.client}</td>
-          <td><span class="montant">${fmt(r.montant)}</span></td>
-          <td><span style="font-family:monospace;font-size:12px">${r.date || '—'}</span></td>
-          <td><span class="status-badge ${statusClass}">${r.invoice_status_label}</span></td>
-          <td><a class="link-btn" href="${r.url}" target="_blank">Voir</a></td>
-        </tr>`;
-      }
-      html += '</tbody></table></div>';
-      return html;
+    });
+
+    renderTable();
+  } catch(e) {
+    document.getElementById('invTable').innerHTML =
+      `<div class="state-box err">⚠️ ${e.message}</div>`;
+  }
+}
+
+function renderTable() {
+  if(!invData) return;
+  const d = invData;
+  const allRows = [...d.detail.overdue,...d.detail.pending,...d.detail.paid];
+  const map = {all:allRows, pending:d.detail.pending, overdue:d.detail.overdue, paid:d.detail.paid};
+  const rows = map[activeTab] || allRows;
+
+  if(!rows.length) {
+    document.getElementById('invTable').innerHTML =
+      '<div class="state-box">✅ Aucune facture dans cette catégorie</div>';
+    return;
+  }
+
+  // Build type lookup
+  const overdueSet = new Set(d.detail.overdue.map(x=>x.id));
+  const pendingSet = new Set(d.detail.pending.map(x=>x.id));
+
+  let h = `<div class="tbl-wrap"><table>
+    <thead><tr>
+      <th>N° Facture</th><th>Client</th><th>Date</th><th>Échéance</th>
+      <th>Montant TTC</th><th>Restant dû</th><th>Statut</th><th>Retard</th><th></th>
+    </tr></thead><tbody>`;
+
+  for(const f of rows) {
+    const type = overdueSet.has(f.id)?'overdue':pendingSet.has(f.id)?'pending':'paid';
+    const statusMap = {
+      overdue:`<span class="s-pill s-overdue">En retard</span>`,
+      pending:`<span class="s-pill s-pending">En attente</span>`,
+      paid:   `<span class="s-pill s-paid">Payée</span>`,
     };
+    const dCls = f.retard ? (f.retard>60?'d-high':f.retard>30?'d-mid':'d-low') : '';
+    const dCell = f.retard ? `<span class="d-pill ${dCls}">+${f.retard}j</span>` : '<span class="muted">—</span>';
 
-    document.getElementById('tableSales').innerHTML =
-      `<div class="split-list">${renderSection('Devis en cours', data.quotes, '')}${renderSection('Bons à facturer', data.orders, 'success-badge')}</div>`;
-  } catch (error) {
-    showError('chartSales', error);
-    showError('tableSales', error);
-    document.getElementById('kpiQuotesSub').textContent = 'Erreur';
-    document.getElementById('kpiOrdersSub').textContent = 'Erreur';
+    h += `<tr>
+      <td class="mono muted">${f.numero}</td>
+      <td style="font-weight:500">${f.client}</td>
+      <td class="mono muted">${f.date||'—'}</td>
+      <td class="mono muted">${f.echeance||'—'}</td>
+      <td class="mono" style="font-weight:600">${EUR(f.ttc)}</td>
+      <td class="mono">${EUR(f.restant)}</td>
+      <td>${statusMap[type]||''}</td>
+      <td>${dCell}</td>
+      <td><a class="link-btn" href="${f.url}" target="_blank">Voir ↗</a></td>
+    </tr>`;
   }
+  h += '</tbody></table></div>';
+  document.getElementById('invTable').innerHTML = h;
 }
 
-async function loadRetard() {
-  try {
-    const query = buildQuery();
-    const data = await fetchJson(`/api/retard?${query}`);
-    const compare = document.getElementById('compareGlobal').checked;
-
-    document.getElementById('kpiRetard').textContent = fmt(data.total);
-    document.getElementById('kpiRetardSub').textContent = `${data.count} facture(s) — ${data.period_label}`;
-    document.getElementById('kpiRetardPct').innerHTML = compare ? pctBadge(data.pct) : '';
-    document.getElementById('retardTableSub').textContent = `Factures en retard — ${data.period_label}`;
-
-    if (data.factures.length === 0) {
-      document.getElementById('tableRetard').innerHTML = '<div class="empty-state">✅ Aucune facture en retard</div>';
-      return;
-    }
-
-    let html = `<table><thead><tr><th>Numéro</th><th>Client</th><th>Montant dû</th><th>Échéance</th><th>Retard</th><th>Priorité</th><th></th></tr></thead><tbody>`;
-    for (const f of data.factures) {
-      html += `<tr>
-        <td><span style="font-family:monospace;font-size:12px;color:#8890a8">${f.numero}</span></td>
-        <td>${f.client}</td>
-        <td><span class="montant">${fmt(f.montant)}</span></td>
-        <td><span style="font-family:monospace;font-size:12px">${f.echeance}</span></td>
-        <td><span class="retard-badge ${f.priority_class}">+${f.retard_jours}j</span></td>
-        <td><span class="status-badge">${f.priority}</span></td>
-        <td><a class="link-btn" href="${f.url}" target="_blank">Voir</a></td>
-      </tr>`;
-    }
-    html += '</tbody></table>';
-    document.getElementById('tableRetard').innerHTML = html;
-  } catch (error) {
-    showError('tableRetard', error);
-    document.getElementById('kpiRetardSub').textContent = 'Erreur';
-  }
-}
-
-function refreshAll() {
-  fetchJson('/api/health?clear_cache=1').finally(() => {
-    loadClients().finally(() => loadAll());
-  });
-}
-
-async function loadAll() {
-  document.getElementById('dateBadge').textContent = new Date().toLocaleDateString('fr-BE', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' });
-  await Promise.all([loadCA(), loadSales(), loadRetard()]);
+async function hardRefresh() {
+  await fetch('/api/health?clear_cache=1').catch(()=>{});
+  await loadClients();
+  await load();
 }
 
 window.addEventListener('DOMContentLoaded', async () => {
-  const today = new Date().toISOString().slice(0, 10);
-  document.getElementById('dateStart').value = today;
-  document.getElementById('dateEnd').value = today;
-  currentCustomStart = today;
-  currentCustomEnd = today;
-
   await loadClients();
-  await loadAll();
+  await load();
 });
 </script>
 </body>
-</html>
-"""
-
-
-def get_request_params():
-    period = request.args.get("period", "month")
-    date_start = request.args.get("date_start")
-    date_end = request.args.get("date_end")
-    partner_id = request.args.get("partner_id") or ""
-    return period, date_start, date_end, partner_id
-
+</html>"""
 
 @app.route("/")
 def index():
     return render_template_string(HTML, db=ODOO_DB)
 
-
 @app.route("/api/health")
 def api_health():
     if request.args.get("clear_cache") == "1":
         _cache.clear()
-    return jsonify({"ok": True, "cache_entries": len(_cache)})
-
+    return jsonify({"ok": True})
 
 @app.route("/api/clients")
 def api_clients():
     return jsonify({"clients": get_clients()})
 
-
-@app.route("/api/ca")
-def api_ca():
-    period, date_start, date_end, partner_id = get_request_params()
-    return jsonify(get_ca(period, date_start, date_end, partner_id))
-
-
-@app.route("/api/retard")
-def api_retard():
-    period, date_start, date_end, partner_id = get_request_params()
-    return jsonify(get_factures_retard(period, date_start, date_end, partner_id))
-
-
-@app.route("/api/sales")
-def api_sales():
-    period, date_start, date_end, partner_id = get_request_params()
-    return jsonify(get_sales_pipeline(period, date_start, date_end, partner_id))
-
+@app.route("/api/invoices")
+def api_invoices():
+    period     = request.args.get("period","month")
+    partner_id = request.args.get("partner_id","")
+    return jsonify(get_invoice_data(period, partner_id))
 
 @app.errorhandler(Exception)
-def handle_error(error):
-    code = getattr(error, "code", 500)
-    return jsonify({"error": str(error)}), code
-
+def handle_err(e):
+    return jsonify({"error": str(e)}), getattr(e,"code",500)
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port)
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT",5000)))
