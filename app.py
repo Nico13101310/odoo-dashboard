@@ -73,6 +73,7 @@ def period_dates(period):
 def odoo_url(model, rid):
     return f"{ODOO_URL}/web#id={rid}&model={model}&view_type=form"
 
+# ── CLIENTS ───────────────────────────────────────────────
 @cached()
 def get_clients():
     rows = search_all("res.partner",
@@ -89,6 +90,7 @@ def partner_domain(pid):
     if not pid: return []
     return [["partner_id","child_of",int(pid)]]
 
+# ── FACTURES ──────────────────────────────────────────────
 @cached()
 def fetch_invoices(d_start, d_end, pid):
     domain = [
@@ -109,6 +111,21 @@ def classify(inv, today):
     if due and datetime.strptime(due,"%Y-%m-%d").date() < today: return "overdue"
     return "pending"
 
+# ── COMMANDES À FACTURER ───────────────────────────────────
+@cached()
+def fetch_to_invoice(d_start, d_end, pid):
+    """Commandes confirmées avec invoice_status = to invoice ou partiellement facturées"""
+    domain = [
+        ["state","in",["sale","done"]],
+        ["invoice_status","in",["to invoice"]],
+        ["date_order",">=",f"{d_start} 00:00:00"],
+        ["date_order","<=",f"{d_end} 23:59:59"],
+    ] + partner_domain(pid)
+    return search_all("sale.order", domain,
+        ["id","name","partner_id","amount_untaxed","amount_total",
+         "date_order","invoice_status","invoice_ids"],
+        order="date_order desc")
+
 @cached()
 def get_invoice_data(period, pid):
     start, end = period_dates(period)
@@ -117,6 +134,8 @@ def get_invoice_data(period, pid):
 
     cur  = fetch_invoices(start, end, pid)
     prev = fetch_invoices(ps, pe, pid)
+    cur_toinv  = fetch_to_invoice(start, end, pid)
+    prev_toinv = fetch_to_invoice(ps, pe, pid)
 
     def stats(rows):
         paid=pending=overdue=0
@@ -155,14 +174,41 @@ def get_invoice_data(period, pid):
             "total_n":len(rows), "detail":detail,
         }
 
+    def stats_toinv(rows):
+        total = 0
+        detail = []
+        for so in rows:
+            htva = so.get("amount_untaxed") or 0
+            total += htva
+            d_order = so.get("date_order","")
+            if d_order and " " in d_order:
+                d_order = d_order.split(" ")[0]
+            detail.append({
+                "id":     so.get("id"),
+                "numero": so.get("name","—"),
+                "client": so["partner_id"][1] if so.get("partner_id") else "Inconnu",
+                "htva":   round(htva,2),
+                "ttc":    round(so.get("amount_total") or 0, 2),
+                "date":   d_order,
+                "url":    odoo_url("sale.order", so.get("id")),
+            })
+        return {"total": round(total,2), "count": len(detail), "detail": detail}
+
     c = stats(cur)
     p = stats(prev)
-    c["ca_pct"]      = pct(c["ca"], p["ca"])
-    c["paid_pct"]    = pct(c["paid"], p["paid"])
-    c["pending_pct"] = pct(c["pending"], p["pending"])
-    c["overdue_pct"] = pct(c["overdue"], p["overdue"])
-    c["period"]      = f"{start} → {end}"
-    c["prev_period"] = f"{ps} → {pe}"
+    ti_cur  = stats_toinv(cur_toinv)
+    ti_prev = stats_toinv(prev_toinv)
+
+    c["ca_pct"]       = pct(c["ca"], p["ca"])
+    c["paid_pct"]     = pct(c["paid"], p["paid"])
+    c["pending_pct"]  = pct(c["pending"], p["pending"])
+    c["overdue_pct"]  = pct(c["overdue"], p["overdue"])
+    c["toinv"]        = ti_cur["total"]
+    c["toinv_n"]      = ti_cur["count"]
+    c["toinv_pct"]    = pct(ti_cur["total"], ti_prev["total"])
+    c["toinv_detail"] = ti_cur["detail"]
+    c["period"]       = f"{start} → {end}"
+    c["prev_period"]  = f"{ps} → {pe}"
 
     # Top clients CA
     by_client={}
@@ -200,71 +246,51 @@ HTML = r"""<!DOCTYPE html>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.0/chart.umd.min.js"></script>
 <style>
 :root {
-  /* ConiMind exact palette */
   --bg:        #0c0e1a;
   --bg2:       #111422;
   --surface:   #161929;
   --surface2:  #1c2035;
   --border:    #252840;
   --border2:   #2e3350;
-
-  /* Brand orange — ConiMind signature */
   --orange:    #f5a623;
   --orange2:   #ffbe4f;
   --orange-glow: rgba(245,166,35,.15);
   --orange-dim:  rgba(245,166,35,.08);
-
-  /* Status */
   --success:   #34d399;
   --warning:   #fbbf24;
   --danger:    #f87171;
   --info:      #60a5fa;
-
-  /* Text */
+  --purple:    #a78bfa;
   --text:      #f0f2fa;
   --text2:     #7c84a8;
   --text3:     #404666;
-
   --radius:    16px;
   --radius-sm: 10px;
 }
-
 *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 body { background: var(--bg); color: var(--text); font-family: 'Outfit', sans-serif; min-height: 100vh; }
-
-/* scrollbar */
 ::-webkit-scrollbar { width: 5px; height: 5px; }
 ::-webkit-scrollbar-track { background: transparent; }
 ::-webkit-scrollbar-thumb { background: var(--border2); border-radius: 3px; }
 
-/* ── HEADER ── */
+/* HEADER */
 header {
   position: sticky; top: 0; z-index: 100;
-  background: rgba(12,14,26,.9);
-  backdrop-filter: blur(24px);
+  background: rgba(12,14,26,.9); backdrop-filter: blur(24px);
   border-bottom: 1px solid var(--border);
-  padding: 0 36px;
-  height: 66px;
+  padding: 0 36px; height: 66px;
   display: flex; align-items: center; justify-content: space-between; gap: 20px;
 }
-
-.logo {
-  display: flex; align-items: center; gap: 11px; text-decoration: none;
-  flex-shrink: 0;
-}
+.logo { display: flex; align-items: center; gap: 11px; text-decoration: none; flex-shrink: 0; }
 .logo-mark {
   width: 38px; height: 38px;
   background: linear-gradient(135deg, #f5a623, #ffbe4f);
-  border-radius: 10px;
-  display: flex; align-items: center; justify-content: center;
-  font-size: 18px;
-  box-shadow: 0 0 24px var(--orange-glow);
+  border-radius: 10px; display: flex; align-items: center; justify-content: center;
+  font-size: 18px; box-shadow: 0 0 24px var(--orange-glow);
 }
 .logo-name { font-size: 17px; font-weight: 800; letter-spacing: -.4px; color: var(--text); }
 .logo-tag  { font-size: 10px; color: var(--text2); font-family: 'JetBrains Mono', monospace; letter-spacing: .5px; }
-
 .controls { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
-
 .pill-group {
   display: flex; background: var(--surface2); border: 1px solid var(--border);
   border-radius: 10px; overflow: hidden; padding: 3px;
@@ -276,20 +302,14 @@ header {
 }
 .pill:hover { color: var(--text); }
 .pill.active { background: var(--orange); color: #0c0e1a; box-shadow: 0 2px 10px var(--orange-glow); }
-
 .select-ctrl {
   background: var(--surface); border: 1px solid var(--border); color: var(--text);
   padding: 8px 12px; border-radius: var(--radius-sm); font-size: 12px;
   font-family: 'Outfit', sans-serif; cursor: pointer; min-width: 170px;
 }
 .select-ctrl:focus { outline: none; border-color: var(--orange); }
-
-.cmp-label {
-  display: flex; align-items: center; gap: 7px;
-  font-size: 12px; color: var(--text2); cursor: pointer; user-select: none;
-}
+.cmp-label { display: flex; align-items: center; gap: 7px; font-size: 12px; color: var(--text2); cursor: pointer; user-select: none; }
 .cmp-label input { accent-color: var(--orange); cursor: pointer; }
-
 .header-right { display: flex; align-items: center; gap: 10px; flex-shrink: 0; }
 .date-chip {
   font-family: 'JetBrains Mono', monospace; font-size: 11px; color: var(--text2);
@@ -297,61 +317,55 @@ header {
 }
 .btn-refresh {
   background: transparent; border: 1px solid var(--border); color: var(--text2);
-  padding: 7px 14px; border-radius: var(--radius-sm); font-size: 13px; cursor: pointer;
-  transition: all .15s;
+  padding: 7px 14px; border-radius: var(--radius-sm); font-size: 13px; cursor: pointer; transition: all .15s;
 }
 .btn-refresh:hover { border-color: var(--orange); color: var(--orange); }
 
-/* ── MAIN ── */
+/* MAIN */
 main { padding: 30px 36px; max-width: 1440px; margin: 0 auto; }
 
-/* ── SECTION LABEL ── */
 .sec-label {
   font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: 2px;
   color: var(--orange); margin-bottom: 16px; display: flex; align-items: center; gap: 10px;
 }
 .sec-label::after { content:''; flex:1; height:1px; background:var(--border); }
 
-/* ── KPIs ── */
-.kpi-grid { display: grid; grid-template-columns: repeat(4,1fr); gap: 14px; margin-bottom: 30px; }
+/* KPIs — grille 5 colonnes */
+.kpi-grid { display: grid; grid-template-columns: repeat(5,1fr); gap: 14px; margin-bottom: 30px; }
 
 .kpi {
   background: var(--surface); border: 1px solid var(--border);
-  border-radius: var(--radius); padding: 24px 20px;
+  border-radius: var(--radius); padding: 22px 18px;
   position: relative; overflow: hidden; transition: border-color .2s, transform .2s;
 }
 .kpi:hover { border-color: var(--border2); transform: translateY(-2px); }
-
-/* glowing top border */
 .kpi::before {
-  content:''; position:absolute; top:0; left:0; right:0; height:2px; border-radius:var(--radius) var(--radius) 0 0;
+  content:''; position:absolute; top:0; left:0; right:0; height:2px;
+  border-radius:var(--radius) var(--radius) 0 0;
 }
-.kpi.k-orange::before  { background: linear-gradient(90deg, var(--orange), var(--orange2)); }
-.kpi.k-green::before   { background: linear-gradient(90deg, var(--success), #6ee7b7); }
-.kpi.k-blue::before    { background: linear-gradient(90deg, var(--info), #93c5fd); }
-.kpi.k-red::before     { background: linear-gradient(90deg, var(--danger), #fca5a5); }
+.kpi.k-orange::before { background: linear-gradient(90deg,var(--orange),var(--orange2)); }
+.kpi.k-green::before  { background: linear-gradient(90deg,var(--success),#6ee7b7); }
+.kpi.k-blue::before   { background: linear-gradient(90deg,var(--info),#93c5fd); }
+.kpi.k-red::before    { background: linear-gradient(90deg,var(--danger),#fca5a5); }
+.kpi.k-purple::before { background: linear-gradient(90deg,var(--purple),#c4b5fd); }
 
-/* subtle bg glow */
-.kpi.k-orange::after { content:''; position:absolute; bottom:-40px; right:-20px; width:120px; height:120px; border-radius:50%; background:var(--orange-dim); filter:blur(30px); }
-
-.kpi-icon {
-  width: 40px; height: 40px; border-radius: 10px;
-  display: flex; align-items: center; justify-content: center; font-size: 18px; margin-bottom: 16px;
-}
+.kpi-icon { width:38px; height:38px; border-radius:9px; display:flex; align-items:center; justify-content:center; font-size:17px; margin-bottom:14px; }
 .k-orange .kpi-icon { background: var(--orange-dim); }
 .k-green  .kpi-icon { background: rgba(52,211,153,.1); }
 .k-blue   .kpi-icon { background: rgba(96,165,250,.1); }
 .k-red    .kpi-icon { background: rgba(248,113,113,.1); }
+.k-purple .kpi-icon { background: rgba(167,139,250,.1); }
 
-.kpi-label { font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: 1px; color: var(--text2); margin-bottom: 8px; }
-.kpi-value { font-size: 27px; font-weight: 800; letter-spacing: -1px; line-height: 1; margin-bottom: 10px; }
+.kpi-label { font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: 1px; color: var(--text2); margin-bottom: 7px; }
+.kpi-value { font-size: 23px; font-weight: 800; letter-spacing: -.8px; line-height: 1; margin-bottom: 9px; }
 .k-orange .kpi-value { color: var(--orange); }
 .k-green  .kpi-value { color: var(--success); }
 .k-blue   .kpi-value { color: var(--info); }
 .k-red    .kpi-value { color: var(--danger); }
+.k-purple .kpi-value { color: var(--purple); }
 
 .kpi-foot { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
-.kpi-sub  { font-size: 11px; color: var(--text2); font-family: 'JetBrains Mono', monospace; }
+.kpi-sub  { font-size: 10px; color: var(--text2); font-family: 'JetBrains Mono', monospace; }
 
 .badge {
   font-size: 10px; font-weight: 700; padding: 2px 8px; border-radius: 100px;
@@ -361,9 +375,8 @@ main { padding: 30px 36px; max-width: 1440px; margin: 0 auto; }
 .b-down { background: rgba(248,113,113,.12); color: var(--danger); }
 .b-flat { background: rgba(124,132,168,.12); color: var(--text2); }
 
-/* ── CHARTS ── */
+/* CHARTS */
 .charts-row { display: grid; grid-template-columns: 1.4fr 1fr; gap: 16px; margin-bottom: 30px; }
-
 .card {
   background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: 26px;
 }
@@ -372,25 +385,20 @@ main { padding: 30px 36px; max-width: 1440px; margin: 0 auto; }
 .card-sub   { font-size: 11px; color: var(--text2); font-family: 'JetBrains Mono', monospace; }
 canvas { max-height: 220px; }
 
-/* ── INVOICE SECTION ── */
+/* INVOICE TABS */
 .inv-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 16px; flex-wrap: wrap; gap: 12px; }
-
 .inv-tabs { display: flex; gap: 3px; background: var(--surface2); border: 1px solid var(--border); border-radius: 12px; padding: 4px; }
 .inv-tab {
-  padding: 7px 18px; border-radius: 9px; font-size: 12px; font-weight: 600;
+  padding: 7px 16px; border-radius: 9px; font-size: 12px; font-weight: 600;
   cursor: pointer; border: none; background: transparent; color: var(--text2);
   font-family: 'Outfit', sans-serif; transition: all .15s; white-space: nowrap;
 }
 .inv-tab:hover { color: var(--text); }
 .inv-tab.active { background: var(--orange); color: #0c0e1a; box-shadow: 0 2px 10px var(--orange-glow); }
-
-.tab-cnt {
-  display: inline-block; margin-left: 6px; background: rgba(255,255,255,.15);
-  padding: 1px 6px; border-radius: 100px; font-size: 10px;
-}
+.tab-cnt { display: inline-block; margin-left: 5px; background: rgba(255,255,255,.15); padding: 1px 6px; border-radius: 100px; font-size: 10px; }
 .inv-tab.active .tab-cnt { background: rgba(12,14,26,.2); }
 
-/* ── TABLE ── */
+/* TABLE */
 .tbl-wrap { overflow-x: auto; }
 table { width: 100%; border-collapse: collapse; }
 thead th {
@@ -405,46 +413,46 @@ tbody td { padding: 12px 14px; font-size: 13px; }
 
 .mono  { font-family: 'JetBrains Mono', monospace; font-size: 12px; }
 .muted { color: var(--text2); }
+.bold  { font-weight: 600; }
 
-.s-pill {
-  display: inline-flex; align-items: center; gap: 5px;
-  padding: 3px 10px; border-radius: 100px; font-size: 11px; font-weight: 600;
-}
+.s-pill { display: inline-flex; align-items: center; gap: 5px; padding: 3px 10px; border-radius: 100px; font-size: 11px; font-weight: 600; }
 .s-pill::before { content:''; width:5px; height:5px; border-radius:50%; background:currentColor; }
 .s-paid    { background: rgba(52,211,153,.1);  color: var(--success); }
 .s-pending { background: rgba(245,166,35,.1);  color: var(--orange); }
 .s-overdue { background: rgba(248,113,113,.1); color: var(--danger); }
+.s-toinv   { background: rgba(167,139,250,.1); color: var(--purple); }
 
-.d-pill {
-  display: inline-block; padding: 2px 9px; border-radius: 7px;
-  font-family: 'JetBrains Mono', monospace; font-size: 11px; font-weight: 700;
-}
+.d-pill { display: inline-block; padding: 2px 9px; border-radius: 7px; font-family: 'JetBrains Mono', monospace; font-size: 11px; font-weight: 700; }
 .d-low  { background: rgba(251,191,36,.1);  color: var(--warning); }
 .d-mid  { background: rgba(248,113,113,.1); color: var(--danger); }
 .d-high { background: rgba(248,113,113,.2); color: var(--danger); }
 
 .link-btn {
   color: var(--orange); text-decoration: none; border: 1px solid var(--border);
-  padding: 4px 11px; border-radius: 7px; font-size: 11px; font-weight: 600;
-  transition: all .15s;
+  padding: 4px 11px; border-radius: 7px; font-size: 11px; font-weight: 600; transition: all .15s;
 }
 .link-btn:hover { border-color: var(--orange); background: var(--orange-dim); }
 
-/* ── STATES ── */
-.state-box {
-  min-height: 140px; display: flex; align-items: center; justify-content: center;
-  color: var(--text2); font-size: 13px; gap: 10px;
+/* À facturer — banner info */
+.toinv-banner {
+  background: rgba(167,139,250,.07); border: 1px solid rgba(167,139,250,.2);
+  border-radius: 10px; padding: 12px 16px; margin-bottom: 16px;
+  display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
 }
+.toinv-banner .bi-label { font-size: 11px; color: var(--text2); }
+.toinv-banner .bi-val   { font-size: 15px; font-weight: 800; color: var(--purple); font-family: 'JetBrains Mono', monospace; }
+.toinv-banner .bi-sep   { color: var(--border2); font-size: 18px; }
+
+.state-box { min-height: 140px; display: flex; align-items: center; justify-content: center; color: var(--text2); font-size: 13px; gap: 10px; }
 .state-box.err { color: #fca5a5; }
-.spin {
-  width: 16px; height: 16px; border: 2px solid var(--border2); border-top-color: var(--orange);
-  border-radius: 50%; animation: spin .7s linear infinite;
-}
+.spin { width: 16px; height: 16px; border: 2px solid var(--border2); border-top-color: var(--orange); border-radius: 50%; animation: spin .7s linear infinite; }
 @keyframes spin { to { transform: rotate(360deg); } }
 
-/* ── RESPONSIVE ── */
-@media (max-width: 1024px) {
-  .kpi-grid   { grid-template-columns: repeat(2,1fr); }
+@media (max-width: 1200px) {
+  .kpi-grid { grid-template-columns: repeat(3,1fr); }
+}
+@media (max-width: 900px) {
+  .kpi-grid { grid-template-columns: repeat(2,1fr); }
   .charts-row { grid-template-columns: 1fr; }
 }
 @media (max-width: 600px) {
@@ -464,23 +472,19 @@ tbody td { padding: 12px 14px; font-size: 13px; }
       <div class="logo-tag">{{ db }} · dashboard</div>
     </div>
   </a>
-
   <div class="controls">
     <div class="pill-group">
       <button class="pill active" data-p="month" onclick="setPeriod('month',this)">Ce mois</button>
       <button class="pill"        data-p="year"  onclick="setPeriod('year',this)">Cette année</button>
     </div>
-
     <select class="select-ctrl" id="clientFilter" onchange="load()">
       <option value="">Tous les clients</option>
     </select>
-
     <label class="cmp-label">
       <input type="checkbox" id="cmpToggle" onchange="load()">
       Comparer N-1
     </label>
   </div>
-
   <div class="header-right">
     <div class="date-chip" id="dateChip">—</div>
     <button class="btn-refresh" onclick="hardRefresh()" title="Actualiser">↻</button>
@@ -488,8 +492,6 @@ tbody td { padding: 12px 14px; font-size: 13px; }
 </header>
 
 <main>
-
-  <!-- KPIs -->
   <div class="sec-label">Vue globale</div>
   <div class="kpi-grid">
     <div class="kpi k-orange">
@@ -497,6 +499,12 @@ tbody td { padding: 12px 14px; font-size: 13px; }
       <div class="kpi-label">CA facturé HTVA</div>
       <div class="kpi-value" id="kCA">—</div>
       <div class="kpi-foot"><span class="kpi-sub" id="kCAsub">…</span><span id="kCApct"></span></div>
+    </div>
+    <div class="kpi k-purple">
+      <div class="kpi-icon">📋</div>
+      <div class="kpi-label">À facturer</div>
+      <div class="kpi-value" id="kToInv">—</div>
+      <div class="kpi-foot"><span class="kpi-sub" id="kToInvsub">…</span><span id="kToInvpct"></span></div>
     </div>
     <div class="kpi k-green">
       <div class="kpi-icon">✅</div>
@@ -518,13 +526,12 @@ tbody td { padding: 12px 14px; font-size: 13px; }
     </div>
   </div>
 
-  <!-- Charts -->
   <div class="charts-row">
     <div class="card">
       <div class="card-head">
         <div>
           <div class="card-title">Évolution du CA</div>
-          <div class="card-sub" id="subMonthly">12 derniers mois · HTVA</div>
+          <div class="card-sub">12 derniers mois · HTVA</div>
         </div>
       </div>
       <canvas id="chartMonthly"></canvas>
@@ -533,19 +540,21 @@ tbody td { padding: 12px 14px; font-size: 13px; }
       <div class="card-head">
         <div>
           <div class="card-title">Top clients</div>
-          <div class="card-sub" id="subTop">CA HTVA · période sélectionnée</div>
+          <div class="card-sub">CA HTVA · période sélectionnée</div>
         </div>
       </div>
       <canvas id="chartTop"></canvas>
     </div>
   </div>
 
-  <!-- Invoice tracker -->
   <div class="inv-header">
     <div class="sec-label" style="margin-bottom:0;flex:1">Suivi des factures client</div>
     <div class="inv-tabs">
       <button class="inv-tab active" onclick="showTab('all',this)">
         Toutes <span class="tab-cnt" id="cnt-all">—</span>
+      </button>
+      <button class="inv-tab" onclick="showTab('toinv',this)">
+        À facturer <span class="tab-cnt" id="cnt-toinv">—</span>
       </button>
       <button class="inv-tab" onclick="showTab('pending',this)">
         En attente <span class="tab-cnt" id="cnt-pending">—</span>
@@ -561,7 +570,6 @@ tbody td { padding: 12px 14px; font-size: 13px; }
   <div class="card" style="padding:16px 20px">
     <div id="invTable"><div class="state-box"><div class="spin"></div> Chargement…</div></div>
   </div>
-
 </main>
 
 <script>
@@ -573,7 +581,7 @@ let chM = null, chT = null;
 const EUR = n => new Intl.NumberFormat('fr-BE',{style:'currency',currency:'EUR',maximumFractionDigits:0}).format(n||0);
 
 function badge(p) {
-  if (p===null||p===undefined) return '';
+  if(p===null||p===undefined) return '';
   const cls = p>0?'b-up':p<0?'b-down':'b-flat';
   return `<span class="badge ${cls}">${p>0?'+':''}${p}% N-1</span>`;
 }
@@ -635,6 +643,10 @@ async function load() {
     document.getElementById('kCAsub').textContent   = `${d.total_n} facture(s) — ${d.period}`;
     document.getElementById('kCApct').innerHTML     = cmp ? badge(d.ca_pct) : '';
 
+    document.getElementById('kToInv').textContent    = EUR(d.toinv);
+    document.getElementById('kToInvsub').textContent = `${d.toinv_n} commande(s) à facturer`;
+    document.getElementById('kToInvpct').innerHTML   = cmp ? badge(d.toinv_pct) : '';
+
     document.getElementById('kPaid').textContent     = EUR(d.paid);
     document.getElementById('kPaidsub').textContent  = `${d.paid_n} facture(s)`;
     document.getElementById('kPaidpct').innerHTML    = cmp ? badge(d.paid_pct) : '';
@@ -648,11 +660,12 @@ async function load() {
     document.getElementById('kOverduepct').innerHTML   = cmp ? badge(d.overdue_pct) : '';
 
     // Tab counts
-    const allRows = [...d.detail.overdue,...d.detail.pending,...d.detail.paid];
-    document.getElementById('cnt-all').textContent     = allRows.length;
-    document.getElementById('cnt-pending').textContent = d.detail.pending.length;
-    document.getElementById('cnt-overdue').textContent = d.detail.overdue.length;
-    document.getElementById('cnt-paid').textContent    = d.detail.paid.length;
+    const allInv = [...d.detail.overdue,...d.detail.pending,...d.detail.paid];
+    document.getElementById('cnt-all').textContent    = allInv.length;
+    document.getElementById('cnt-toinv').textContent  = d.toinv_n;
+    document.getElementById('cnt-pending').textContent= d.detail.pending.length;
+    document.getElementById('cnt-overdue').textContent= d.detail.overdue.length;
+    document.getElementById('cnt-paid').textContent   = d.detail.paid.length;
 
     // Monthly chart
     if(chM) chM.destroy();
@@ -666,8 +679,7 @@ async function load() {
           borderColor:'#f5a623',
           backgroundColor:'rgba(245,166,35,.07)',
           borderWidth:2.5, fill:true, tension:.4,
-          pointBackgroundColor:'#f5a623',
-          pointRadius:3, pointHoverRadius:6,
+          pointBackgroundColor:'#f5a623', pointRadius:3, pointHoverRadius:6,
         }]
       },
       options:{
@@ -688,11 +700,7 @@ async function load() {
         labels:d.top_labels,
         datasets:[{
           data:d.top_values,
-          backgroundColor:[
-            'rgba(245,166,35,.8)','rgba(52,211,153,.7)','rgba(96,165,250,.7)',
-            'rgba(248,113,113,.7)','rgba(167,139,250,.7)','rgba(251,191,36,.7)',
-            'rgba(52,211,153,.5)','rgba(245,166,35,.5)',
-          ],
+          backgroundColor:['rgba(245,166,35,.8)','rgba(52,211,153,.7)','rgba(96,165,250,.7)','rgba(248,113,113,.7)','rgba(167,139,250,.7)','rgba(251,191,36,.7)','rgba(52,211,153,.5)','rgba(245,166,35,.5)'],
           borderRadius:5, borderWidth:0,
         }]
       },
@@ -716,9 +724,48 @@ async function load() {
 function renderTable() {
   if(!invData) return;
   const d = invData;
-  const allRows = [...d.detail.overdue,...d.detail.pending,...d.detail.paid];
-  const map = {all:allRows, pending:d.detail.pending, overdue:d.detail.overdue, paid:d.detail.paid};
-  const rows = map[activeTab] || allRows;
+
+  // Onglet "À facturer" — commandes SO
+  if(activeTab === 'toinv') {
+    const rows = d.toinv_detail || [];
+    if(!rows.length) {
+      document.getElementById('invTable').innerHTML =
+        '<div class="state-box">✅ Aucune commande à facturer sur la période</div>';
+      return;
+    }
+    const total = rows.reduce((s,r)=>s+r.htva,0);
+    let h = `
+      <div class="toinv-banner">
+        <span class="bi-label">Total à facturer sur la période :</span>
+        <span class="bi-val">${EUR(total)}</span>
+        <span class="bi-sep">·</span>
+        <span class="bi-label">${rows.length} commande(s) · HTVA</span>
+      </div>
+      <div class="tbl-wrap"><table>
+      <thead><tr>
+        <th>N° Commande</th><th>Client</th><th>Date commande</th>
+        <th>Montant HTVA</th><th>Montant TTC</th><th>Statut</th><th></th>
+      </tr></thead><tbody>`;
+    for(const r of rows) {
+      h += `<tr>
+        <td class="mono muted">${r.numero}</td>
+        <td class="bold">${r.client}</td>
+        <td class="mono muted">${r.date||'—'}</td>
+        <td class="mono bold">${EUR(r.htva)}</td>
+        <td class="mono">${EUR(r.ttc)}</td>
+        <td><span class="s-pill s-toinv">À facturer</span></td>
+        <td><a class="link-btn" href="${r.url}" target="_blank">Voir ↗</a></td>
+      </tr>`;
+    }
+    h += '</tbody></table></div>';
+    document.getElementById('invTable').innerHTML = h;
+    return;
+  }
+
+  // Autres onglets — factures
+  const allInv = [...d.detail.overdue,...d.detail.pending,...d.detail.paid];
+  const map = {all:allInv, pending:d.detail.pending, overdue:d.detail.overdue, paid:d.detail.paid};
+  const rows = map[activeTab] || allInv;
 
   if(!rows.length) {
     document.getElementById('invTable').innerHTML =
@@ -726,7 +773,6 @@ function renderTable() {
     return;
   }
 
-  // Build type lookup
   const overdueSet = new Set(d.detail.overdue.map(x=>x.id));
   const pendingSet = new Set(d.detail.pending.map(x=>x.id));
 
@@ -743,15 +789,14 @@ function renderTable() {
       pending:`<span class="s-pill s-pending">En attente</span>`,
       paid:   `<span class="s-pill s-paid">Payée</span>`,
     };
-    const dCls = f.retard ? (f.retard>60?'d-high':f.retard>30?'d-mid':'d-low') : '';
-    const dCell = f.retard ? `<span class="d-pill ${dCls}">+${f.retard}j</span>` : '<span class="muted">—</span>';
-
+    const dCls = f.retard?(f.retard>60?'d-high':f.retard>30?'d-mid':'d-low'):'';
+    const dCell = f.retard?`<span class="d-pill ${dCls}">+${f.retard}j</span>`:'<span class="muted">—</span>';
     h += `<tr>
       <td class="mono muted">${f.numero}</td>
-      <td style="font-weight:500">${f.client}</td>
+      <td class="bold">${f.client}</td>
       <td class="mono muted">${f.date||'—'}</td>
       <td class="mono muted">${f.echeance||'—'}</td>
-      <td class="mono" style="font-weight:600">${EUR(f.ttc)}</td>
+      <td class="mono bold">${EUR(f.ttc)}</td>
       <td class="mono">${EUR(f.restant)}</td>
       <td>${statusMap[type]||''}</td>
       <td>${dCell}</td>
